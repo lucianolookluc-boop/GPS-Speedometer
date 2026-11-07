@@ -2,7 +2,11 @@ package br.com.gpsspeedometer
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ActivityInfo
 import android.graphics.Canvas
@@ -16,8 +20,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -43,12 +49,20 @@ class MainActivity : Activity(), LocationListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemUi()
         speedView = SpeedDisplay(this)
         setContentView(speedView)
         loadSavedHazards()
+        var downX = 0f
+        var downY = 0f
+        speedView.setOnTouchListener { _, ev ->
+            if (ev.action == MotionEvent.ACTION_DOWN) { downX = ev.x; downY = ev.y }
+            false
+        }
+        speedView.setOnClickListener {
+            if (speedView.inMenuZone(downX, downY)) showMenu()
+        }
         speedView.setOnLongClickListener {
             saveRadarHere()
             true
@@ -103,16 +117,44 @@ class MainActivity : Activity(), LocationListener {
         if (requestCode == 100 && grantResults.any { it == PackageManager.PERMISSION_GRANTED }) startGps()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemUi()
+    }
+
+    private fun parseHazards(raw: String): List<RoadHazard> {
+        val out = mutableListOf<RoadHazard>()
+        for (line in raw.split("\n")) {
+            val p = line.trim().split(",")
+            if (p.size < 2) continue
+            val lat = p[0].trim().toDoubleOrNull() ?: continue
+            val lon = p[1].trim().toDoubleOrNull() ?: continue
+            if (lat !in -90.0..90.0 || lon !in -180.0..180.0) continue
+            val bearing = p.getOrNull(2)?.trim()?.toFloatOrNull()
+            out.add(RoadHazard("saved", lat, lon, bearing))
+        }
+        return out
+    }
+
+    private fun serializeHazards(): String =
+        savedHazards.joinToString("\n") { "${it.lat},${it.lon},${it.bearing ?: ""}" }
+
+    private fun persistHazards() {
+        getSharedPreferences("radares", Context.MODE_PRIVATE).edit()
+            .putString("lista", serializeHazards()).apply()
+    }
+
     private fun loadSavedHazards() {
         val raw = getSharedPreferences("radares", Context.MODE_PRIVATE).getString("lista", "") ?: ""
         savedHazards.clear()
-        for (line in raw.split("\n")) {
-            val p = line.split(",")
-            if (p.size < 2) continue
-            val lat = p[0].toDoubleOrNull() ?: continue
-            val lon = p[1].toDoubleOrNull() ?: continue
-            val bearing = p.getOrNull(2)?.toFloatOrNull()
-            savedHazards.add(RoadHazard("saved", lat, lon, bearing))
+        savedHazards.addAll(parseHazards(raw))
+    }
+
+    private fun isNearSaved(lat: Double, lon: Double): Boolean {
+        val pt = Location("x").apply { latitude = lat; longitude = lon }
+        return savedHazards.any {
+            val other = Location("y").apply { latitude = it.lat; longitude = it.lon }
+            other.distanceTo(pt) < 40f
         }
     }
 
@@ -120,17 +162,78 @@ class MainActivity : Activity(), LocationListener {
         val loc = lastLocation
         if (loc == null) { speak("Sem sinal de GPS"); return }
         val bearing = if (loc.hasBearing() && loc.hasSpeed() && loc.speed > 2f) loc.bearing else null
-        // evita duplicados a menos de 40 m
-        val dup = savedHazards.any {
-            val pt = Location("x").apply { latitude = it.lat; longitude = it.lon }
-            pt.distanceTo(loc) < 40f
-        }
-        if (!dup) {
+        if (!isNearSaved(loc.latitude, loc.longitude)) {
             savedHazards.add(RoadHazard("saved", loc.latitude, loc.longitude, bearing))
-            val text = savedHazards.joinToString("\n") { "${it.lat},${it.lon},${it.bearing ?: ""}" }
-            getSharedPreferences("radares", Context.MODE_PRIVATE).edit().putString("lista", text).apply()
+            persistHazards()
         }
         speak("Radar salvo")
+    }
+
+    private fun showMenu() {
+        val items = arrayOf(
+            "Salvar radar aqui",
+            "Exportar radares (compartilhar)",
+            "Importar radares (texto copiado)",
+            "Apagar todos os radares"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Radares salvos: ${savedHazards.size}")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> saveRadarHere()
+                    1 -> exportRadars()
+                    2 -> importRadars()
+                    3 -> confirmClear()
+                }
+            }
+            .setNegativeButton("Fechar", null)
+            .show()
+    }
+
+    private fun exportRadars() {
+        if (savedHazards.isEmpty()) {
+            Toast.makeText(this, "Nenhum radar salvo", Toast.LENGTH_LONG).show()
+            return
+        }
+        val text = "GPSSPEED\n" + serializeHazards()
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("radares", text))
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        startActivity(Intent.createChooser(send, "Exportar radares"))
+    }
+
+    private fun importRadars() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = cm.primaryClip
+        val text = if (clip != null && clip.itemCount > 0)
+            clip.getItemAt(0).coerceToText(this).toString() else ""
+        var added = 0
+        for (h in parseHazards(text)) {
+            if (!isNearSaved(h.lat, h.lon)) {
+                savedHazards.add(h)
+                added++
+            }
+        }
+        if (added > 0) persistHazards()
+        Toast.makeText(
+            this,
+            if (added > 0) "$added radares importados" else "Nada para importar. Copie o texto exportado primeiro.",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    private fun confirmClear() {
+        AlertDialog.Builder(this)
+            .setTitle("Apagar todos os radares salvos?")
+            .setPositiveButton("Apagar") { _, _ ->
+                savedHazards.clear()
+                persistHazards()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
     }
 
     override fun onLocationChanged(location: Location) {
@@ -289,6 +392,10 @@ class MainActivity : Activity(), LocationListener {
             textAlign = Paint.Align.CENTER
             isSubpixelText = true
         }
+        private val menuPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(80, 80, 80)
+            textAlign = Paint.Align.CENTER
+        }
         private var limitText = ""
         private var speedText = ""
 
@@ -296,23 +403,39 @@ class MainActivity : Activity(), LocationListener {
         fun setLimit(value: String) { limitText = value; postInvalidateOnAnimation() }
         fun setSpeed(value: String) { speedText = value; postInvalidateOnAnimation() }
 
+        fun inMenuZone(x: Float, y: Float): Boolean =
+            x in (width * 0.4f)..(width * 0.6f) && y > height * 0.88f
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val half = width / 2f
-            drawHugeNumber(canvas, limitText, 0f, half, leftPaint)
-            drawHugeNumber(canvas, speedText, half, width.toFloat(), rightPaint)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (h > w) {
+                // Vertical: limite em cima, velocidade embaixo
+                drawHugeNumber(canvas, limitText, 0f, w, 0f, h / 2f, leftPaint)
+                drawHugeNumber(canvas, speedText, 0f, w, h / 2f, h, rightPaint)
+            } else {
+                // Horizontal: limite à esquerda, velocidade à direita
+                drawHugeNumber(canvas, limitText, 0f, w / 2f, 0f, h, leftPaint)
+                drawHugeNumber(canvas, speedText, w / 2f, w, 0f, h, rightPaint)
+            }
+            menuPaint.textSize = h * 0.045f
+            canvas.drawText("•••", w / 2f, h * 0.97f, menuPaint)
         }
 
-        private fun drawHugeNumber(canvas: Canvas, value: String, left: Float, right: Float, paint: Paint) {
+        private fun drawHugeNumber(
+            canvas: Canvas, value: String,
+            left: Float, right: Float, top: Float, bottom: Float, paint: Paint
+        ) {
             if (value.isEmpty()) return
             val availableWidth = (right - left) * 0.94f
-            val availableHeight = height * 0.90f
+            val availableHeight = (bottom - top) * 0.90f
             paint.textSize = 1000f
             val widthAt1000 = paint.measureText(value).coerceAtLeast(1f)
             val heightAt1000 = paint.fontMetrics.descent - paint.fontMetrics.ascent
             paint.textSize = 1000f * minOf(availableWidth / widthAt1000, availableHeight / heightAt1000)
             val x = (left + right) / 2f
-            val y = height / 2f - (paint.ascent() + paint.descent()) / 2f
+            val y = (top + bottom) / 2f - (paint.ascent() + paint.descent()) / 2f
             canvas.drawText(value, x, y, paint)
         }
     }
