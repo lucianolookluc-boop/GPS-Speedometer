@@ -36,6 +36,8 @@ class MainActivity : Activity(), LocationListener {
     private var lastQueryAt = 0L
     private var hazards: List<RoadHazard> = emptyList()
     private val alerted = mutableMapOf<String, Long>()
+    private var lastLocation: Location? = null
+    private val savedHazards = mutableListOf<RoadHazard>()
     private val worker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -46,6 +48,11 @@ class MainActivity : Activity(), LocationListener {
         hideSystemUi()
         speedView = SpeedDisplay(this)
         setContentView(speedView)
+        loadSavedHazards()
+        speedView.setOnLongClickListener {
+            saveRadarHere()
+            true
+        }
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -96,7 +103,38 @@ class MainActivity : Activity(), LocationListener {
         if (requestCode == 100 && grantResults.any { it == PackageManager.PERMISSION_GRANTED }) startGps()
     }
 
+    private fun loadSavedHazards() {
+        val raw = getSharedPreferences("radares", Context.MODE_PRIVATE).getString("lista", "") ?: ""
+        savedHazards.clear()
+        for (line in raw.split("\n")) {
+            val p = line.split(",")
+            if (p.size < 2) continue
+            val lat = p[0].toDoubleOrNull() ?: continue
+            val lon = p[1].toDoubleOrNull() ?: continue
+            val bearing = p.getOrNull(2)?.toFloatOrNull()
+            savedHazards.add(RoadHazard("saved", lat, lon, bearing))
+        }
+    }
+
+    private fun saveRadarHere() {
+        val loc = lastLocation
+        if (loc == null) { speak("Sem sinal de GPS"); return }
+        val bearing = if (loc.hasBearing() && loc.hasSpeed() && loc.speed > 2f) loc.bearing else null
+        // evita duplicados a menos de 40 m
+        val dup = savedHazards.any {
+            val pt = Location("x").apply { latitude = it.lat; longitude = it.lon }
+            pt.distanceTo(loc) < 40f
+        }
+        if (!dup) {
+            savedHazards.add(RoadHazard("saved", loc.latitude, loc.longitude, bearing))
+            val text = savedHazards.joinToString("\n") { "${it.lat},${it.lon},${it.bearing ?: ""}" }
+            getSharedPreferences("radares", Context.MODE_PRIVATE).edit().putString("lista", text).apply()
+        }
+        speak("Radar salvo")
+    }
+
     override fun onLocationChanged(location: Location) {
+        lastLocation = location
         val kmh = if (location.hasSpeed()) (location.speed * 3.6f).coerceAtLeast(0f) else 0f
         speedView.setSpeed(kmh.toInt().toString())
 
@@ -122,6 +160,7 @@ class MainActivity : Activity(), LocationListener {
                       way(around:100,$lat,$lon)["highway"]["maxspeed"];
                       node(around:650,$lat,$lon)["highway"="speed_camera"];
                       node(around:650,$lat,$lon)["enforcement"="traffic_signals"];
+                      node(around:650,$lat,$lon)["enforcement"~"maxspeed|average_speed"];
                       node(around:650,$lat,$lon)["traffic_calming"];
                     );
                     out center tags;
@@ -164,7 +203,7 @@ class MainActivity : Activity(), LocationListener {
                         val enforcement = tags.optString("enforcement")
                         val calming = tags.optString("traffic_calming")
                         when {
-                            highway == "speed_camera" -> foundHazards.add(RoadHazard("camera", latValue, lonValue))
+                            highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" -> foundHazards.add(RoadHazard("camera", latValue, lonValue))
                             enforcement == "traffic_signals" -> foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
                             calming.isNotBlank() && calming != "no" -> foundHazards.add(RoadHazard("bump", latValue, lonValue))
                         }
@@ -196,17 +235,22 @@ class MainActivity : Activity(), LocationListener {
     private fun checkHazards(location: Location) {
         if (!location.hasBearing()) return
         val now = System.currentTimeMillis()
-        for (hazard in hazards) {
+        for (hazard in hazards + savedHazards) {
             val point = Location("hazard").apply { latitude = hazard.lat; longitude = hazard.lon }
             val distance = location.distanceTo(point)
             if (distance !in 20f..450f) continue
             val delta = abs(((location.bearingTo(point) - location.bearing + 540f) % 360f) - 180f)
             if (delta > 75f) continue
+            val saved = hazard.bearing
+            if (saved != null) {
+                val diff = abs(((location.bearing - saved + 540f) % 360f) - 180f)
+                if (diff > 60f) continue
+            }
             val key = "${hazard.kind}:${hazard.lat}:${hazard.lon}"
             if (now - (alerted[key] ?: 0L) < 120_000L) continue
             alerted[key] = now
             when (hazard.kind) {
-                "camera" -> speak("Radar na via")
+                "camera", "saved" -> speak("Radar na via")
                 "signal_camera" -> speak("Radar de semáforo na via")
                 "bump" -> speak("Lombada na via")
             }
@@ -230,7 +274,7 @@ class MainActivity : Activity(), LocationListener {
         super.onDestroy()
     }
 
-    private data class RoadHazard(val kind: String, val lat: Double, val lon: Double)
+    private data class RoadHazard(val kind: String, val lat: Double, val lon: Double, val bearing: Float? = null)
 
     private class SpeedDisplay(context: Context) : View(context) {
         private val leftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
