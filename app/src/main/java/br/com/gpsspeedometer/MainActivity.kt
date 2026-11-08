@@ -1,5 +1,88 @@
-package br.com.gpsspeedometer
+Claude
+Reworking the way-geometry handling for the query results
 
+Vou olhar o código com cuidado, porque se o site mostra o limite e o app não, a falha está na forma como o app busca. Provavelmente algo falha em silêncio.
+Compartilhou um arquivo, executou um comando
+
+Daqui não consigo reproduzir o erro, porque não tenho acesso à internet para testar o serviço. Pelo código, o app falhava sem avisar e eu encontrei pontos fracos que podem explicar. Fiz um MainActivity.kt novo que corrige esses pontos e mostra na tela o que está acontecendo. Ainda não compilei nem testei.
+
+Prováveis causas no código antigo
+
+    Erro engolido: qualquer erro de rede ou resposta recusada do serviço era ignorado, sem nenhum aviso.
+    Um só servidor, sem identificação: o app usava apenas o overpass-api.de e não informava o nome do app. Esse servidor público recusa pedidos com frequência quando está cheio.
+    Tentava de novo só depois de 120 m: se a primeira consulta falhasse, o app ficava sem limite até você andar mais.
+    Limites em outro campo: ruas que têm o limite só em maxspeed:forward ou maxspeed:backward eram ignoradas.
+    Escolha da via: ele escolhia a via pelo ponto central dela, e não pela parte mais perto de você. Em vias compridas isso podia pegar a rua errada.
+
+O que mudou
+
+    Se um servidor falhar, tenta mais dois outros e se identifica como “GPSSpeedometer”.
+    Se falhar, tenta de novo em 15 segundos, sem esperar você andar.
+    Procura também o limite nos campos forward e backward e escolhe a via pela geometria real.
+    Mostra uma mensagem cinza no canto inferior esquerdo da tela:
+        “Mapa: consultando...”
+        “Mapa: OK, limite 60 (2 vias)”
+        “Mapa: OK, mas sem limite cadastrado aqui”
+        “Mapa: erro HTTP 429” (ou outro erro)
+
+Atualize o MainActivity.kt no GitHub como das outras vezes (lápis, apagar tudo, colar, Commit changes) e instale o APK novo.
+
+Ao testar de novo, me diga o que aparece nessa mensagem. Ela mostra se é erro de internet, se o serviço recusou o pedido ou se a rua realmente não tem limite no mapa, e assim eu corrijo o ponto certo.
+Mainactivity
+KT
+1794161773091_image.png
+Confirming the app issue is on the app side
+
+Isso confirma que o mapa tem o dado. A Avenida das Nações (way 65867470) está com maxspeed = 50, então a falha está no app e não no OpenStreetMap. O app antigo deveria ter achado esse 50, e não achou.
+
+Dá para fazer o teste que resolve:
+
+    Atualize o MainActivity.kt no GitHub com o arquivo novo que mandei, espere o build na aba Actions e instale o APK novo por cima.
+    Abra o app perto dessa avenida, ou em qualquer rua que você viu com limite no site, e espere uns 20 segundos com o GPS ligado e a internet funcionando.
+    Olhe a mensagem cinza no canto inferior esquerdo da tela e me diga o texto exato.
+
+O texto indica a causa:
+
+    “Mapa: OK, limite 50”: funcionou, e o número deve aparecer à esquerda.
+    “Mapa: erro HTTP 429” ou outro erro de rede: o serviço recusou o pedido ou o celular está sem internet para o app.
+    “Mapa: OK, mas sem limite cadastrado aqui”: a consulta funcionou, mas não achou a via, e eu corrijo a lógica.
+    Nenhuma mensagem: o app não está consultando. Pode ser a permissão de localização ou o GPS sem sinal, e eu olho essa parte.
+
+Esta mensagem aparece sem testes no carro? Vale testar parado, na rua. Se a mensagem ficar vazia, confira também se o APK instalado é o novo, olhando se a mensagem existe.
+
+deixei mais 3 min so aparece consultando
+Descartando un bloqueo por falta de conexión
+
+Ficar parado em “consultando...” por 3 minutos é um sinal importante. Significa que o pedido de internet travou e nunca terminou, nem deu erro. Isso costuma acontecer quando o celular está sem internet de verdade, mas ainda “conectado” a um Wi-Fi sem acesso ou a um chip sem dados.
+
+Antes de qualquer coisa, faça este teste no próprio aparelho que roda o app: abra o navegador dele e entre em overpass-api.de. Se não carregar, o problema é a internet do celular e não o app. Se carregar, o problema é o app.
+
+Também vou corrigir o travamento, para o app avisar em vez de ficar esperando.
+Compartilhou um arquivo, executou um comando
+
+Mandei um MainActivity.kt novo. Agora a consulta de internet tem limite de 25 segundos, não fica mais parada, e tenta de novo a cada 15 segundos. Não consegui compilar nem testar.
+
+Se o pedido falhar, a mensagem cinza no canto inferior esquerdo passa a dizer o motivo, por exemplo:
+
+    “sem resposta em 25 s (sem internet?)”
+    “UnknownHostException”, que quer dizer que o celular não consegue achar o servidor, ou seja, está sem internet para o app
+    “HTTP 429” ou outro código, que quer dizer que o servidor recusou
+
+O que fazer agora
+
+    No celular, abra o navegador e teste overpass-api.de. Se não abrir, o aparelho está sem dados móveis ou o Wi-Fi não tem acesso. Ligue os dados móveis, ou o roteador do celular, e teste de novo. O velocímetro funciona sem internet, mas o limite e os radares do mapa não.
+    Atualize o MainActivity.kt no GitHub, baixe o APK novo e instale por cima.
+    Me diga qual mensagem aparece depois de 30 segundos.
+
+Se o navegador do celular abre o site normalmente e o app continua sem consultar, me avise, porque aí o problema é outro, e eu investigo a permissão de internet e a configuração do app.
+Mainactivity
+KT
+
+
+Claude é uma IA e pode cometer erros.
+Mainactivity · KT
+package br.com.gpsspeedometer
+ 
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
@@ -29,9 +112,12 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.math.abs
-
+ 
 class MainActivity : Activity(), LocationListener {
     private lateinit var locationManager: LocationManager
     private lateinit var speedView: SpeedDisplay
@@ -45,8 +131,9 @@ class MainActivity : Activity(), LocationListener {
     private var lastLocation: Location? = null
     private val savedHazards = mutableListOf<RoadHazard>()
     private val worker = Executors.newSingleThreadExecutor()
+    private val netExecutor = Executors.newCachedThreadPool()
     private val mainHandler = Handler(Looper.getMainLooper())
-
+ 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -67,7 +154,7 @@ class MainActivity : Activity(), LocationListener {
             saveRadarHere()
             true
         }
-
+ 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 val result = tts?.setLanguage(Locale("pt", "BR"))
@@ -75,7 +162,7 @@ class MainActivity : Activity(), LocationListener {
                     result != TextToSpeech.LANG_NOT_SUPPORTED
             }
         }
-
+ 
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         if (hasLocationPermission()) startGps()
         else requestPermissions(
@@ -83,7 +170,7 @@ class MainActivity : Activity(), LocationListener {
             100
         )
     }
-
+ 
     private fun hideSystemUi() {
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = (
@@ -95,11 +182,11 @@ class MainActivity : Activity(), LocationListener {
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE
         )
     }
-
+ 
     private fun hasLocationPermission(): Boolean =
         checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
         checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-
+ 
     private fun startGps() {
         if (!hasLocationPermission()) return
         try {
@@ -111,17 +198,17 @@ class MainActivity : Activity(), LocationListener {
             }
         } catch (_: SecurityException) { }
     }
-
+ 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 100 && grantResults.any { it == PackageManager.PERMISSION_GRANTED }) startGps()
     }
-
+ 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) hideSystemUi()
     }
-
+ 
     private fun parseHazards(raw: String): List<RoadHazard> {
         val out = mutableListOf<RoadHazard>()
         for (line in raw.split("\n")) {
@@ -135,21 +222,21 @@ class MainActivity : Activity(), LocationListener {
         }
         return out
     }
-
+ 
     private fun serializeHazards(): String =
         savedHazards.joinToString("\n") { "${it.lat},${it.lon},${it.bearing ?: ""}" }
-
+ 
     private fun persistHazards() {
         getSharedPreferences("radares", Context.MODE_PRIVATE).edit()
             .putString("lista", serializeHazards()).apply()
     }
-
+ 
     private fun loadSavedHazards() {
         val raw = getSharedPreferences("radares", Context.MODE_PRIVATE).getString("lista", "") ?: ""
         savedHazards.clear()
         savedHazards.addAll(parseHazards(raw))
     }
-
+ 
     private fun isNearSaved(lat: Double, lon: Double): Boolean {
         val pt = Location("x").apply { latitude = lat; longitude = lon }
         return savedHazards.any {
@@ -157,7 +244,7 @@ class MainActivity : Activity(), LocationListener {
             other.distanceTo(pt) < 40f
         }
     }
-
+ 
     private fun saveRadarHere() {
         val loc = lastLocation
         if (loc == null) { speak("Sem sinal de GPS"); return }
@@ -168,7 +255,7 @@ class MainActivity : Activity(), LocationListener {
         }
         speak("Radar salvo")
     }
-
+ 
     private fun showMenu() {
         val items = arrayOf(
             "Salvar radar aqui",
@@ -189,7 +276,7 @@ class MainActivity : Activity(), LocationListener {
             .setNegativeButton("Fechar", null)
             .show()
     }
-
+ 
     private fun exportRadars() {
         if (savedHazards.isEmpty()) {
             Toast.makeText(this, "Nenhum radar salvo", Toast.LENGTH_LONG).show()
@@ -204,7 +291,7 @@ class MainActivity : Activity(), LocationListener {
         }
         startActivity(Intent.createChooser(send, "Exportar radares"))
     }
-
+ 
     private fun importRadars() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = cm.primaryClip
@@ -224,7 +311,7 @@ class MainActivity : Activity(), LocationListener {
             Toast.LENGTH_LONG
         ).show()
     }
-
+ 
     private fun confirmClear() {
         AlertDialog.Builder(this)
             .setTitle("Apagar todos os radares salvos?")
@@ -235,12 +322,12 @@ class MainActivity : Activity(), LocationListener {
             .setNegativeButton("Cancelar", null)
             .show()
     }
-
+ 
     override fun onLocationChanged(location: Location) {
         lastLocation = location
         val kmh = if (location.hasSpeed()) (location.speed * 3.6f).coerceAtLeast(0f) else 0f
         speedView.setSpeed(kmh.toInt().toString())
-
+ 
         val previous = lastQueryLocation
         val movedEnough = previous == null || previous.distanceTo(location) >= 120f
         val timeEnough = System.currentTimeMillis() - lastQueryAt >= 15_000L
@@ -251,25 +338,25 @@ class MainActivity : Activity(), LocationListener {
         }
         checkHazards(location)
     }
-
+ 
     private val overpassUrls = listOf(
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
         "https://overpass.private.coffee/api/interpreter"
     )
-
+ 
     private fun postStatus(text: String) {
         mainHandler.post { speedView.setStatus(text) }
     }
-
+ 
     private fun fetchOverpass(query: String): String {
         val encoded = URLEncoder.encode(query, "UTF-8")
         var lastError = "sem resposta"
         for (base in overpassUrls) {
             try {
                 val connection = URL("$base?data=$encoded").openConnection() as HttpURLConnection
-                connection.connectTimeout = 8000
-                connection.readTimeout = 15000
+                connection.connectTimeout = 6000
+                connection.readTimeout = 10000
                 connection.requestMethod = "GET"
                 connection.setRequestProperty("User-Agent", "GPSSpeedometer/1.0 (Android; uso pessoal)")
                 connection.setRequestProperty("Accept", "application/json")
@@ -287,7 +374,7 @@ class MainActivity : Activity(), LocationListener {
         }
         throw Exception(lastError)
     }
-
+ 
     private fun wayDistance(item: JSONObject, from: Location): Float {
         val geom = item.optJSONArray("geometry") ?: return Float.MAX_VALUE / 2
         var best = Float.MAX_VALUE / 2
@@ -310,7 +397,7 @@ class MainActivity : Activity(), LocationListener {
         }
         return best
     }
-
+ 
     private fun queryRoadData(location: Location) {
         postStatus("Mapa: consultando...")
         worker.execute {
@@ -330,19 +417,27 @@ class MainActivity : Activity(), LocationListener {
                     );
                     out geom tags;
                 """.trimIndent()
-                val body = fetchOverpass(query)
+                val future = netExecutor.submit<String> { fetchOverpass(query) }
+                val body = try {
+                    future.get(25, TimeUnit.SECONDS)
+                } catch (e: TimeoutException) {
+                    future.cancel(true)
+                    throw Exception("sem resposta em 25 s (sem internet?)")
+                } catch (e: ExecutionException) {
+                    throw Exception(e.cause?.message ?: "falha de rede")
+                }
                 val elements = JSONObject(body).optJSONArray("elements")
                     ?: throw Exception("resposta sem dados")
                 var nearestLimit: Int? = null
                 var nearestDistance = Float.MAX_VALUE
                 var waysSeen = 0
                 val foundHazards = mutableListOf<RoadHazard>()
-
+ 
                 for (i in 0 until elements.length()) {
                     val item = elements.optJSONObject(i) ?: continue
                     val tags = item.optJSONObject("tags") ?: JSONObject()
                     val type = item.optString("type")
-
+ 
                     if (type == "way") {
                         val raw = tags.optString("maxspeed")
                             .ifBlank { tags.optString("maxspeed:forward") }
@@ -372,7 +467,7 @@ class MainActivity : Activity(), LocationListener {
                         }
                     }
                 }
-
+ 
                 val finalLimit = nearestLimit
                 mainHandler.post {
                     if (finalLimit != null) {
@@ -395,13 +490,13 @@ class MainActivity : Activity(), LocationListener {
             }
         }
     }
-
+ 
     private fun parseSpeedLimit(raw: String): Int? {
         val normalized = raw.trim().lowercase(Locale.ROOT)
         if (normalized.contains("mph")) return null
         return Regex("[0-9]+").find(normalized)?.value?.toIntOrNull()?.takeIf { it in 10..160 }
     }
-
+ 
     private fun checkHazards(location: Location) {
         if (!location.hasBearing()) return
         val now = System.currentTimeMillis()
@@ -426,26 +521,27 @@ class MainActivity : Activity(), LocationListener {
             }
         }
     }
-
+ 
     private fun speak(message: String) {
         if (ttsReady) tts?.speak(message, TextToSpeech.QUEUE_ADD, null, "gps_${System.currentTimeMillis()}")
     }
-
+ 
     override fun onProviderEnabled(provider: String) {}
     override fun onProviderDisabled(provider: String) {}
     @Deprecated("Deprecated in Android")
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-
+ 
     override fun onDestroy() {
         try { locationManager.removeUpdates(this) } catch (_: Exception) { }
         tts?.stop()
         tts?.shutdown()
         worker.shutdownNow()
+        netExecutor.shutdownNow()
         super.onDestroy()
     }
-
+ 
     private data class RoadHazard(val kind: String, val lat: Double, val lon: Double, val bearing: Float? = null)
-
+ 
     private class SpeedDisplay(context: Context) : View(context) {
         private val leftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(57, 255, 20)
@@ -470,16 +566,16 @@ class MainActivity : Activity(), LocationListener {
         private var statusText = ""
         private var limitText = ""
         private var speedText = ""
-
+ 
         init { setBackgroundColor(Color.BLACK) }
         fun setLimit(value: String) { limitText = value; postInvalidateOnAnimation() }
         fun setSpeed(value: String) { speedText = value; postInvalidateOnAnimation() }
-
+ 
         fun setStatus(value: String) { statusText = value; postInvalidateOnAnimation() }
-
+ 
         fun inMenuZone(x: Float, y: Float): Boolean =
             x in (width * 0.4f)..(width * 0.6f) && y > height * 0.88f
-
+ 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val w = width.toFloat()
@@ -498,7 +594,7 @@ class MainActivity : Activity(), LocationListener {
             statusPaint.textSize = h * 0.035f
             canvas.drawText(statusText, w * 0.015f, h * 0.985f, statusPaint)
         }
-
+ 
         private fun drawHugeNumber(
             canvas: Canvas, value: String,
             left: Float, right: Float, top: Float, bottom: Float, paint: Paint
@@ -516,3 +612,5 @@ class MainActivity : Activity(), LocationListener {
         }
     }
 }
+ 
+Claude terminou a resposta
