@@ -266,30 +266,65 @@ class MainActivity : Activity(), LocationListener {
         mainHandler.post { speedView.setStatus(text) }
     }
 
-    private fun fetchOverpass(query: String): String {
+    private fun fetchOne(base: String, encoded: String): String {
+        val connection = URL("$base?data=$encoded").openConnection() as HttpURLConnection
+        try {
+            connection.connectTimeout = 6000
+            connection.readTimeout = 12000
+            connection.requestMethod = "GET"
+            connection.setRequestProperty("User-Agent", "GPSSpeedometer/1.0 (Android; uso pessoal)")
+            connection.setRequestProperty("Accept", "application/json")
+            val code = connection.responseCode
+            if (code != 200) throw Exception("HTTP $code")
+            return connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun probeInternet(): Boolean = try {
+        val c = URL("https://www.google.com/generate_204").openConnection() as HttpURLConnection
+        c.connectTimeout = 4000
+        c.readTimeout = 4000
+        val ok = c.responseCode in 200..299
+        c.disconnect()
+        ok
+    } catch (e: Exception) {
+        false
+    }
+
+    // Consulta os servidores ao mesmo tempo e usa o primeiro que responder.
+    private fun fetchAny(query: String): String {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        var lastError = "sem resposta"
-        for (base in overpassUrls) {
-            try {
-                val connection = URL("$base?data=$encoded").openConnection() as HttpURLConnection
-                connection.connectTimeout = 6000
-                connection.readTimeout = 10000
-                connection.requestMethod = "GET"
-                connection.setRequestProperty("User-Agent", "GPSSpeedometer/1.0 (Android; uso pessoal)")
-                connection.setRequestProperty("Accept", "application/json")
-                val code = connection.responseCode
-                if (code == 200) {
-                    val body = connection.inputStream.bufferedReader().use { it.readText() }
-                    connection.disconnect()
-                    return body
+        val errors = java.util.concurrent.ConcurrentHashMap<String, String>()
+        val service = java.util.concurrent.ExecutorCompletionService<String>(netExecutor)
+        val futures = overpassUrls.map { base ->
+            service.submit<String> {
+                try {
+                    fetchOne(base, encoded)
+                } catch (e: Exception) {
+                    val host = base.substringAfter("://").substringBefore("/")
+                    errors[host] = e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "")
+                    throw e
                 }
-                lastError = "HTTP $code"
-                connection.disconnect()
-            } catch (e: Exception) {
-                lastError = e.javaClass.simpleName
             }
         }
-        throw Exception(lastError)
+        val deadline = System.currentTimeMillis() + 25_000L
+        var remaining = futures.size
+        try {
+            while (remaining > 0) {
+                val left = deadline - System.currentTimeMillis()
+                if (left <= 0) break
+                val done = service.poll(left, TimeUnit.MILLISECONDS) ?: break
+                remaining--
+                try { return done.get() } catch (_: Exception) { }
+            }
+        } finally {
+            futures.forEach { it.cancel(true) }
+        }
+        val internet = if (probeInternet()) "internet OK" else "SEM internet"
+        val detail = if (errors.isEmpty()) "sem resposta" else errors.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        throw Exception("$internet | $detail")
     }
 
     private fun wayDistance(item: JSONObject, from: Location): Float {
@@ -334,15 +369,7 @@ class MainActivity : Activity(), LocationListener {
                     );
                     out geom tags;
                 """.trimIndent()
-                val future = netExecutor.submit<String> { fetchOverpass(query) }
-                val body = try {
-                    future.get(25, TimeUnit.SECONDS)
-                } catch (e: TimeoutException) {
-                    future.cancel(true)
-                    throw Exception("sem resposta em 25 s (sem internet?)")
-                } catch (e: ExecutionException) {
-                    throw Exception(e.cause?.message ?: "falha de rede")
-                }
+                val body = fetchAny(query)
                 val elements = JSONObject(body).optJSONArray("elements")
                     ?: throw Exception("resposta sem dados")
                 var nearestLimit: Int? = null
@@ -509,7 +536,18 @@ class MainActivity : Activity(), LocationListener {
             menuPaint.textSize = h * 0.045f
             canvas.drawText("•••", w / 2f, h * 0.97f, menuPaint)
             statusPaint.textSize = h * 0.035f
-            canvas.drawText(statusText, w * 0.015f, h * 0.985f, statusPaint)
+            val lines = mutableListOf<String>()
+            var rest = statusText
+            while (rest.isNotEmpty() && lines.size < 4) {
+                val n = statusPaint.breakText(rest, true, w * 0.97f, null).coerceAtLeast(1)
+                lines.add(rest.substring(0, n))
+                rest = rest.substring(n)
+            }
+            val lineH = h * 0.042f
+            val firstY = h * 0.985f - (lines.size - 1) * lineH
+            for (i in lines.indices) {
+                canvas.drawText(lines[i], w * 0.015f, firstY + i * lineH, statusPaint)
+            }
         }
 
         private fun drawHugeNumber(
