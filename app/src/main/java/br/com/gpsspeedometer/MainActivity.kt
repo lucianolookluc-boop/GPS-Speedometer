@@ -49,6 +49,9 @@ class MainActivity : Activity(), LocationListener {
     private val savedHazards = mutableListOf<RoadHazard>()
     private val worker = Executors.newSingleThreadExecutor()
     private val netExecutor = Executors.newCachedThreadPool()
+    private val hazardWorker = Executors.newSingleThreadExecutor()
+    private val hazardBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var mapHazards = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -58,6 +61,7 @@ class MainActivity : Activity(), LocationListener {
         speedView = SpeedDisplay(this)
         setContentView(speedView)
         loadSavedHazards()
+        mapHazards = getSharedPreferences("config", Context.MODE_PRIVATE).getBoolean("radares_mapa", false)
         var downX = 0f
         var downY = 0f
         speedView.setOnTouchListener { _, ev ->
@@ -178,7 +182,8 @@ class MainActivity : Activity(), LocationListener {
             "Salvar radar aqui",
             "Exportar radares (compartilhar)",
             "Importar radares (texto copiado)",
-            "Apagar todos os radares"
+            "Apagar todos os radares",
+            "Radares do mapa: " + (if (mapHazards) "LIGADO (pode atrasar)" else "DESLIGADO")
         )
         AlertDialog.Builder(this)
             .setTitle("Radares salvos: ${savedHazards.size}")
@@ -188,6 +193,17 @@ class MainActivity : Activity(), LocationListener {
                     1 -> exportRadars()
                     2 -> importRadars()
                     3 -> confirmClear()
+                    4 -> {
+                        mapHazards = !mapHazards
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putBoolean("radares_mapa", mapHazards).apply()
+                        if (!mapHazards) hazards = emptyList()
+                        Toast.makeText(
+                            this,
+                            if (mapHazards) "Radares do mapa ligados" else "Radares do mapa desligados",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 }
             }
             .setNegativeButton("Fechar", null)
@@ -246,8 +262,8 @@ class MainActivity : Activity(), LocationListener {
         speedView.setSpeed(kmh.toInt().toString())
 
         val previous = lastQueryLocation
-        val movedEnough = previous == null || previous.distanceTo(location) >= 120f
-        val timeEnough = System.currentTimeMillis() - lastQueryAt >= 15_000L
+        val movedEnough = previous == null || previous.distanceTo(location) >= 80f
+        val timeEnough = System.currentTimeMillis() - lastQueryAt >= 10_000L
         if (movedEnough && timeEnough) {
             lastQueryLocation = Location(location)
             lastQueryAt = System.currentTimeMillis()
@@ -417,52 +433,64 @@ class MainActivity : Activity(), LocationListener {
                 return@execute
             }
 
-            // Parte 2: radares e lombadas (consulta por \u00e1rea retangular)
-            val t1 = System.currentTimeMillis()
-            try {
-                val dLat = 650.0 / 111320.0
-                val dLon = dLat / Math.cos(Math.toRadians(lat)).coerceAtLeast(0.2)
-                val bbox = "(${lat - dLat},${lon - dLon},${lat + dLat},${lon + dLon})"
-                val hazardQuery = """
-                    [out:json][timeout:20];
-                    (
-                      node["highway"="speed_camera"]$bbox;
-                      node["enforcement"="maxspeed"]$bbox;
-                      node["enforcement"="average_speed"]$bbox;
-                      node["enforcement"="traffic_signals"]$bbox;
-                      node["traffic_calming"]$bbox;
-                    );
-                    out body;
-                """.trimIndent()
-                val elements = runQuery(hazardQuery)
-                val foundHazards = mutableListOf<RoadHazard>()
-                for (i in 0 until elements.length()) {
-                    val item = elements.optJSONObject(i) ?: continue
-                    if (item.optString("type") != "node") continue
-                    val tags = item.optJSONObject("tags") ?: continue
-                    val latValue = item.optDouble("lat", Double.NaN)
-                    val lonValue = item.optDouble("lon", Double.NaN)
-                    if (latValue.isNaN() || lonValue.isNaN()) continue
-                    val highway = tags.optString("highway")
-                    val enforcement = tags.optString("enforcement")
-                    val calming = tags.optString("traffic_calming")
-                    when {
-                        highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" ->
-                            foundHazards.add(RoadHazard("camera", latValue, lonValue))
-                        enforcement == "traffic_signals" ->
-                            foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
-                        calming.isNotBlank() && calming != "no" ->
-                            foundHazards.add(RoadHazard("bump", latValue, lonValue))
-                    }
+            // Parte 2: radares do mapa (opcional e em outra fila, para n\u00e3o atrasar o limite)
+            if (!mapHazards) return@execute
+            if (!hazardBusy.compareAndSet(false, true)) return@execute
+            hazardWorker.execute {
+                try {
+                    queryHazards(lat, lon)
+                } finally {
+                    hazardBusy.set(false)
                 }
-                mainHandler.post {
-                    hazards = foundHazards
-                    speedView.setStatus("$limitStatus | radares/lombadas no mapa: ${foundHazards.size} (${(System.currentTimeMillis() - t1) / 1000}s)")
+            }
+        }
+    }
+
+    private fun queryHazards(lat: Double, lon: Double) {
+        val t1 = System.currentTimeMillis()
+        try {
+            val dLat = 650.0 / 111320.0
+            val dLon = dLat / Math.cos(Math.toRadians(lat)).coerceAtLeast(0.2)
+            val bbox = "(${lat - dLat},${lon - dLon},${lat + dLat},${lon + dLon})"
+            val hazardQuery = """
+                [out:json][timeout:20];
+                (
+                  node["highway"="speed_camera"]$bbox;
+                  node["enforcement"="maxspeed"]$bbox;
+                  node["enforcement"="average_speed"]$bbox;
+                  node["enforcement"="traffic_signals"]$bbox;
+                  node["traffic_calming"]$bbox;
+                );
+                out body;
+            """.trimIndent()
+            val elements = runQuery(hazardQuery)
+            val foundHazards = mutableListOf<RoadHazard>()
+            for (i in 0 until elements.length()) {
+                val item = elements.optJSONObject(i) ?: continue
+                if (item.optString("type") != "node") continue
+                val tags = item.optJSONObject("tags") ?: continue
+                val latValue = item.optDouble("lat", Double.NaN)
+                val lonValue = item.optDouble("lon", Double.NaN)
+                if (latValue.isNaN() || lonValue.isNaN()) continue
+                val highway = tags.optString("highway")
+                val enforcement = tags.optString("enforcement")
+                val calming = tags.optString("traffic_calming")
+                when {
+                    highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" ->
+                        foundHazards.add(RoadHazard("camera", latValue, lonValue))
+                    enforcement == "traffic_signals" ->
+                        foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
+                    calming.isNotBlank() && calming != "no" ->
+                        foundHazards.add(RoadHazard("bump", latValue, lonValue))
                 }
-            } catch (e: Exception) {
-                mainHandler.post {
-                    speedView.setStatus("$limitStatus | radares: erro apos ${(System.currentTimeMillis() - t1) / 1000}s: ${e.message}")
-                }
+            }
+            mainHandler.post {
+                hazards = foundHazards
+                speedView.setStatus("$limitStatus | radares/lombadas no mapa: ${foundHazards.size} (${(System.currentTimeMillis() - t1) / 1000}s)")
+            }
+        } catch (e: Exception) {
+            mainHandler.post {
+                speedView.setStatus("$limitStatus | radares: erro apos ${(System.currentTimeMillis() - t1) / 1000}s: ${e.message}")
             }
         }
     }
@@ -513,6 +541,7 @@ class MainActivity : Activity(), LocationListener {
         tts?.shutdown()
         worker.shutdownNow()
         netExecutor.shutdownNow()
+        hazardWorker.shutdownNow()
         super.onDestroy()
     }
 
