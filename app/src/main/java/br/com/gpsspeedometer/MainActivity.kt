@@ -299,7 +299,7 @@ class MainActivity : Activity(), LocationListener {
         val errors = java.util.concurrent.ConcurrentHashMap<String, String>()
         val service = java.util.concurrent.ExecutorCompletionService<String>(netExecutor)
         val futures = overpassUrls.map { base ->
-            service.submit<String> {
+            service.submit(java.util.concurrent.Callable<String> {
                 try {
                     fetchOne(base, encoded)
                 } catch (e: Exception) {
@@ -307,7 +307,7 @@ class MainActivity : Activity(), LocationListener {
                     errors[host] = e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "")
                     throw e
                 }
-            }
+            })
         }
         val deadline = System.currentTimeMillis() + 25_000L
         var remaining = futures.size
