@@ -362,6 +362,7 @@ class MainActivity : Activity(), LocationListener {
         worker.execute {
             val lat = location.latitude
             val lon = location.longitude
+            val t0 = System.currentTimeMillis()
 
             // Parte 1: limite de velocidade da via (consulta leve)
             try {
@@ -395,8 +396,8 @@ class MainActivity : Activity(), LocationListener {
                     }
                 }
                 val finalLimit = nearestLimit
-                val status = if (finalLimit != null) "Mapa: OK, limite $finalLimit ($waysSeen vias)"
-                else "Mapa: OK, mas sem limite cadastrado aqui"
+                val status = if (finalLimit != null) "Mapa: OK, limite $finalLimit ($waysSeen vias, ${(System.currentTimeMillis() - t0) / 1000}s)"
+                else "Mapa: OK, mas sem limite cadastrado aqui (${(System.currentTimeMillis() - t0) / 1000}s)"
                 mainHandler.post {
                     limitStatus = status
                     if (finalLimit != null) {
@@ -417,6 +418,7 @@ class MainActivity : Activity(), LocationListener {
             }
 
             // Parte 2: radares e lombadas (consulta por \u00e1rea retangular)
+            val t1 = System.currentTimeMillis()
             try {
                 val dLat = 650.0 / 111320.0
                 val dLon = dLat / Math.cos(Math.toRadians(lat)).coerceAtLeast(0.2)
@@ -455,11 +457,11 @@ class MainActivity : Activity(), LocationListener {
                 }
                 mainHandler.post {
                     hazards = foundHazards
-                    speedView.setStatus("$limitStatus | radares/lombadas no mapa: ${foundHazards.size}")
+                    speedView.setStatus("$limitStatus | radares/lombadas no mapa: ${foundHazards.size} (${(System.currentTimeMillis() - t1) / 1000}s)")
                 }
             } catch (e: Exception) {
                 mainHandler.post {
-                    speedView.setStatus("$limitStatus | radares: erro ${e.message}")
+                    speedView.setStatus("$limitStatus | radares: erro apos ${(System.currentTimeMillis() - t1) / 1000}s: ${e.message}")
                 }
             }
         }
@@ -537,6 +539,7 @@ class MainActivity : Activity(), LocationListener {
             color = Color.rgb(110, 110, 110)
             textAlign = Paint.Align.LEFT
         }
+        private val statusBgPaint = Paint().apply { color = Color.argb(200, 0, 0, 0) }
         private var statusText = ""
         private var limitText = ""
         private var speedText = ""
@@ -565,16 +568,19 @@ class MainActivity : Activity(), LocationListener {
             }
             menuPaint.textSize = h * 0.045f
             canvas.drawText("•••", w / 2f, h * 0.97f, menuPaint)
-            statusPaint.textSize = h * 0.035f
+            statusPaint.textSize = minOf(h, w) * 0.03f
             val lines = mutableListOf<String>()
             var rest = statusText
-            while (rest.isNotEmpty() && lines.size < 4) {
+            while (rest.isNotEmpty() && lines.size < 9) {
                 val n = statusPaint.breakText(rest, true, w * 0.97f, null).coerceAtLeast(1)
                 lines.add(rest.substring(0, n))
                 rest = rest.substring(n)
             }
-            val lineH = h * 0.042f
+            val lineH = minOf(h, w) * 0.036f
             val firstY = h * 0.985f - (lines.size - 1) * lineH
+            if (lines.isNotEmpty()) {
+                canvas.drawRect(0f, firstY - lineH, w, h, statusBgPaint)
+            }
             for (i in lines.indices) {
                 canvas.drawText(lines[i], w * 0.015f, firstY + i * lineH, statusPaint)
             }
