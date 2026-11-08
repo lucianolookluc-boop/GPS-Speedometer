@@ -269,8 +269,8 @@ class MainActivity : Activity(), LocationListener {
     private fun fetchOne(base: String, encoded: String): String {
         val connection = URL("$base?data=$encoded").openConnection() as HttpURLConnection
         try {
-            connection.connectTimeout = 6000
-            connection.readTimeout = 12000
+            connection.connectTimeout = 8000
+            connection.readTimeout = 25000
             connection.requestMethod = "GET"
             connection.setRequestProperty("User-Agent", "GPSSpeedometer/1.0 (Android; uso pessoal)")
             connection.setRequestProperty("Accept", "application/json")
@@ -309,7 +309,7 @@ class MainActivity : Activity(), LocationListener {
                 }
             })
         }
-        val deadline = System.currentTimeMillis() + 25_000L
+        val deadline = System.currentTimeMillis() + 30_000L
         var remaining = futures.size
         try {
             while (remaining > 0) {
@@ -350,86 +350,116 @@ class MainActivity : Activity(), LocationListener {
         return best
     }
 
+    private var limitStatus = ""
+
+    private fun runQuery(query: String): org.json.JSONArray {
+        val body = fetchAny(query)
+        return JSONObject(body).optJSONArray("elements") ?: throw Exception("resposta sem dados")
+    }
+
     private fun queryRoadData(location: Location) {
         postStatus("Mapa: consultando...")
         worker.execute {
+            val lat = location.latitude
+            val lon = location.longitude
+
+            // Parte 1: limite de velocidade da via (consulta leve)
             try {
-                val lat = location.latitude
-                val lon = location.longitude
-                val query = """
-                    [out:json][timeout:12];
+                val limitQuery = """
+                    [out:json][timeout:20];
                     (
                       way(around:100,$lat,$lon)["highway"]["maxspeed"];
                       way(around:100,$lat,$lon)["highway"]["maxspeed:forward"];
                       way(around:100,$lat,$lon)["highway"]["maxspeed:backward"];
-                      node(around:650,$lat,$lon)["highway"="speed_camera"];
-                      node(around:650,$lat,$lon)["enforcement"="traffic_signals"];
-                      node(around:650,$lat,$lon)["enforcement"~"maxspeed|average_speed"];
-                      node(around:650,$lat,$lon)["traffic_calming"];
                     );
-                    out geom tags;
+                    out body geom;
                 """.trimIndent()
-                val body = fetchAny(query)
-                val elements = JSONObject(body).optJSONArray("elements")
-                    ?: throw Exception("resposta sem dados")
+                val elements = runQuery(limitQuery)
                 var nearestLimit: Int? = null
                 var nearestDistance = Float.MAX_VALUE
                 var waysSeen = 0
-                val foundHazards = mutableListOf<RoadHazard>()
-
                 for (i in 0 until elements.length()) {
                     val item = elements.optJSONObject(i) ?: continue
-                    val tags = item.optJSONObject("tags") ?: JSONObject()
-                    val type = item.optString("type")
-
-                    if (type == "way") {
-                        val raw = tags.optString("maxspeed")
-                            .ifBlank { tags.optString("maxspeed:forward") }
-                            .ifBlank { tags.optString("maxspeed:backward") }
-                        if (raw.isBlank()) continue
-                        val parsed = parseSpeedLimit(raw) ?: continue
-                        waysSeen++
-                        val distance = wayDistance(item, location)
-                        if (distance < nearestDistance) {
-                            nearestLimit = parsed
-                            nearestDistance = distance
-                        }
-                    } else if (type == "node") {
-                        val latValue = item.optDouble("lat", Double.NaN)
-                        val lonValue = item.optDouble("lon", Double.NaN)
-                        if (latValue.isNaN() || lonValue.isNaN()) continue
-                        val highway = tags.optString("highway")
-                        val enforcement = tags.optString("enforcement")
-                        val calming = tags.optString("traffic_calming")
-                        when {
-                            highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" ->
-                                foundHazards.add(RoadHazard("camera", latValue, lonValue))
-                            enforcement == "traffic_signals" ->
-                                foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
-                            calming.isNotBlank() && calming != "no" ->
-                                foundHazards.add(RoadHazard("bump", latValue, lonValue))
-                        }
+                    if (item.optString("type") != "way") continue
+                    val tags = item.optJSONObject("tags") ?: continue
+                    val raw = tags.optString("maxspeed")
+                        .ifBlank { tags.optString("maxspeed:forward") }
+                        .ifBlank { tags.optString("maxspeed:backward") }
+                    if (raw.isBlank()) continue
+                    val parsed = parseSpeedLimit(raw) ?: continue
+                    waysSeen++
+                    val distance = wayDistance(item, location)
+                    if (distance < nearestDistance) {
+                        nearestLimit = parsed
+                        nearestDistance = distance
                     }
                 }
-
                 val finalLimit = nearestLimit
+                val status = if (finalLimit != null) "Mapa: OK, limite $finalLimit ($waysSeen vias)"
+                else "Mapa: OK, mas sem limite cadastrado aqui"
                 mainHandler.post {
+                    limitStatus = status
                     if (finalLimit != null) {
                         speedView.setLimit(finalLimit.toString())
-                        speedView.setStatus("Mapa: OK, limite $finalLimit ($waysSeen vias)")
                         if (lastLimit != finalLimit) {
                             lastLimit = finalLimit
                             speak("Limite de velocidade, $finalLimit quil\u00f4metros por hora")
                         }
-                    } else {
-                        speedView.setStatus("Mapa: OK, mas sem limite cadastrado aqui")
                     }
-                    hazards = foundHazards
+                    speedView.setStatus(status)
                 }
             } catch (e: Exception) {
                 mainHandler.post {
                     lastQueryLocation = null // tenta de novo no pr\u00f3ximo ciclo
                     speedView.setStatus("Mapa: erro ${e.message}")
+                }
+                return@execute
+            }
+
+            // Parte 2: radares e lombadas (consulta por \u00e1rea retangular)
+            try {
+                val dLat = 650.0 / 111320.0
+                val dLon = dLat / Math.cos(Math.toRadians(lat)).coerceAtLeast(0.2)
+                val bbox = "(${lat - dLat},${lon - dLon},${lat + dLat},${lon + dLon})"
+                val hazardQuery = """
+                    [out:json][timeout:20];
+                    (
+                      node["highway"="speed_camera"]$bbox;
+                      node["enforcement"="maxspeed"]$bbox;
+                      node["enforcement"="average_speed"]$bbox;
+                      node["enforcement"="traffic_signals"]$bbox;
+                      node["traffic_calming"]$bbox;
+                    );
+                    out body;
+                """.trimIndent()
+                val elements = runQuery(hazardQuery)
+                val foundHazards = mutableListOf<RoadHazard>()
+                for (i in 0 until elements.length()) {
+                    val item = elements.optJSONObject(i) ?: continue
+                    if (item.optString("type") != "node") continue
+                    val tags = item.optJSONObject("tags") ?: continue
+                    val latValue = item.optDouble("lat", Double.NaN)
+                    val lonValue = item.optDouble("lon", Double.NaN)
+                    if (latValue.isNaN() || lonValue.isNaN()) continue
+                    val highway = tags.optString("highway")
+                    val enforcement = tags.optString("enforcement")
+                    val calming = tags.optString("traffic_calming")
+                    when {
+                        highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" ->
+                            foundHazards.add(RoadHazard("camera", latValue, lonValue))
+                        enforcement == "traffic_signals" ->
+                            foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
+                        calming.isNotBlank() && calming != "no" ->
+                            foundHazards.add(RoadHazard("bump", latValue, lonValue))
+                    }
+                }
+                mainHandler.post {
+                    hazards = foundHazards
+                    speedView.setStatus("$limitStatus | radares/lombadas no mapa: ${foundHazards.size}")
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    speedView.setStatus("$limitStatus | radares: erro ${e.message}")
                 }
             }
         }
