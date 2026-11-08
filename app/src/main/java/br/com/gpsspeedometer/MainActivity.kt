@@ -252,7 +252,67 @@ class MainActivity : Activity(), LocationListener {
         checkHazards(location)
     }
 
+    private val overpassUrls = listOf(
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter"
+    )
+
+    private fun postStatus(text: String) {
+        mainHandler.post { speedView.setStatus(text) }
+    }
+
+    private fun fetchOverpass(query: String): String {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        var lastError = "sem resposta"
+        for (base in overpassUrls) {
+            try {
+                val connection = URL("$base?data=$encoded").openConnection() as HttpURLConnection
+                connection.connectTimeout = 8000
+                connection.readTimeout = 15000
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("User-Agent", "GPSSpeedometer/1.0 (Android; uso pessoal)")
+                connection.setRequestProperty("Accept", "application/json")
+                val code = connection.responseCode
+                if (code == 200) {
+                    val body = connection.inputStream.bufferedReader().use { it.readText() }
+                    connection.disconnect()
+                    return body
+                }
+                lastError = "HTTP $code"
+                connection.disconnect()
+            } catch (e: Exception) {
+                lastError = e.javaClass.simpleName
+            }
+        }
+        throw Exception(lastError)
+    }
+
+    private fun wayDistance(item: JSONObject, from: Location): Float {
+        val geom = item.optJSONArray("geometry") ?: return Float.MAX_VALUE / 2
+        var best = Float.MAX_VALUE / 2
+        val pt = Location("p")
+        var prevLat = Double.NaN
+        var prevLon = Double.NaN
+        for (j in 0 until geom.length()) {
+            val g = geom.optJSONObject(j) ?: continue
+            val glat = g.optDouble("lat")
+            val glon = g.optDouble("lon")
+            if (glat.isNaN() || glon.isNaN()) continue
+            pt.latitude = glat; pt.longitude = glon
+            best = minOf(best, from.distanceTo(pt))
+            if (!prevLat.isNaN()) {
+                // ponto médio do trecho, para vias com poucos vértices
+                pt.latitude = (glat + prevLat) / 2.0; pt.longitude = (glon + prevLon) / 2.0
+                best = minOf(best, from.distanceTo(pt))
+            }
+            prevLat = glat; prevLon = glon
+        }
+        return best
+    }
+
     private fun queryRoadData(location: Location) {
+        postStatus("Mapa: consultando...")
         worker.execute {
             try {
                 val lat = location.latitude
@@ -261,70 +321,77 @@ class MainActivity : Activity(), LocationListener {
                     [out:json][timeout:12];
                     (
                       way(around:100,$lat,$lon)["highway"]["maxspeed"];
+                      way(around:100,$lat,$lon)["highway"]["maxspeed:forward"];
+                      way(around:100,$lat,$lon)["highway"]["maxspeed:backward"];
                       node(around:650,$lat,$lon)["highway"="speed_camera"];
                       node(around:650,$lat,$lon)["enforcement"="traffic_signals"];
                       node(around:650,$lat,$lon)["enforcement"~"maxspeed|average_speed"];
                       node(around:650,$lat,$lon)["traffic_calming"];
                     );
-                    out center tags;
+                    out geom tags;
                 """.trimIndent()
-                val encoded = URLEncoder.encode(query, "UTF-8")
-                val connection = URL("https://overpass-api.de/api/interpreter?data=$encoded")
-                    .openConnection() as HttpURLConnection
-                connection.connectTimeout = 8000
-                connection.readTimeout = 15000
-                connection.requestMethod = "GET"
-                val body = connection.inputStream.bufferedReader().use { it.readText() }
-                connection.disconnect()
-                val elements = JSONObject(body).optJSONArray("elements") ?: return@execute
+                val body = fetchOverpass(query)
+                val elements = JSONObject(body).optJSONArray("elements")
+                    ?: throw Exception("resposta sem dados")
                 var nearestLimit: Int? = null
                 var nearestDistance = Float.MAX_VALUE
+                var waysSeen = 0
                 val foundHazards = mutableListOf<RoadHazard>()
 
                 for (i in 0 until elements.length()) {
                     val item = elements.optJSONObject(i) ?: continue
                     val tags = item.optJSONObject("tags") ?: JSONObject()
                     val type = item.optString("type")
-                    val center = item.optJSONObject("center")
-                    val latValue: Double? = if (item.has("lat")) item.optDouble("lat") else center?.optDouble("lat")
-                    val lonValue: Double? = if (item.has("lon")) item.optDouble("lon") else center?.optDouble("lon")
-                    if (latValue == null || lonValue == null || latValue.isNaN() || lonValue.isNaN()) continue
 
-                    val point = Location("osm").apply { latitude = latValue; longitude = lonValue }
-                    val distance = location.distanceTo(point)
-
-                    if (type == "way" && tags.has("maxspeed") && distance < nearestDistance) {
-                        val parsed = parseSpeedLimit(tags.optString("maxspeed"))
-                        if (parsed != null) {
+                    if (type == "way") {
+                        val raw = tags.optString("maxspeed")
+                            .ifBlank { tags.optString("maxspeed:forward") }
+                            .ifBlank { tags.optString("maxspeed:backward") }
+                        if (raw.isBlank()) continue
+                        val parsed = parseSpeedLimit(raw) ?: continue
+                        waysSeen++
+                        val distance = wayDistance(item, location)
+                        if (distance < nearestDistance) {
                             nearestLimit = parsed
                             nearestDistance = distance
                         }
-                    }
-
-                    if (type == "node") {
+                    } else if (type == "node") {
+                        val latValue = item.optDouble("lat", Double.NaN)
+                        val lonValue = item.optDouble("lon", Double.NaN)
+                        if (latValue.isNaN() || lonValue.isNaN()) continue
                         val highway = tags.optString("highway")
                         val enforcement = tags.optString("enforcement")
                         val calming = tags.optString("traffic_calming")
                         when {
-                            highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" -> foundHazards.add(RoadHazard("camera", latValue, lonValue))
-                            enforcement == "traffic_signals" -> foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
-                            calming.isNotBlank() && calming != "no" -> foundHazards.add(RoadHazard("bump", latValue, lonValue))
+                            highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" ->
+                                foundHazards.add(RoadHazard("camera", latValue, lonValue))
+                            enforcement == "traffic_signals" ->
+                                foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
+                            calming.isNotBlank() && calming != "no" ->
+                                foundHazards.add(RoadHazard("bump", latValue, lonValue))
                         }
                     }
                 }
 
+                val finalLimit = nearestLimit
                 mainHandler.post {
-                    nearestLimit?.let { limit ->
-                        speedView.setLimit(limit.toString())
-                        if (lastLimit != limit) {
-                            lastLimit = limit
-                            speak("Limite de velocidade, $limit quilômetros por hora")
+                    if (finalLimit != null) {
+                        speedView.setLimit(finalLimit.toString())
+                        speedView.setStatus("Mapa: OK, limite $finalLimit ($waysSeen vias)")
+                        if (lastLimit != finalLimit) {
+                            lastLimit = finalLimit
+                            speak("Limite de velocidade, $finalLimit quil\u00f4metros por hora")
                         }
+                    } else {
+                        speedView.setStatus("Mapa: OK, mas sem limite cadastrado aqui")
                     }
                     hazards = foundHazards
                 }
-            } catch (_: Exception) {
-                // Sem dados: conserva a última leitura; não inventa limite nem alerta.
+            } catch (e: Exception) {
+                mainHandler.post {
+                    lastQueryLocation = null // tenta de novo no pr\u00f3ximo ciclo
+                    speedView.setStatus("Mapa: erro ${e.message}")
+                }
             }
         }
     }
@@ -396,12 +463,19 @@ class MainActivity : Activity(), LocationListener {
             color = Color.rgb(80, 80, 80)
             textAlign = Paint.Align.CENTER
         }
+        private val statusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(110, 110, 110)
+            textAlign = Paint.Align.LEFT
+        }
+        private var statusText = ""
         private var limitText = ""
         private var speedText = ""
 
         init { setBackgroundColor(Color.BLACK) }
         fun setLimit(value: String) { limitText = value; postInvalidateOnAnimation() }
         fun setSpeed(value: String) { speedText = value; postInvalidateOnAnimation() }
+
+        fun setStatus(value: String) { statusText = value; postInvalidateOnAnimation() }
 
         fun inMenuZone(x: Float, y: Float): Boolean =
             x in (width * 0.4f)..(width * 0.6f) && y > height * 0.88f
@@ -421,6 +495,8 @@ class MainActivity : Activity(), LocationListener {
             }
             menuPaint.textSize = h * 0.045f
             canvas.drawText("•••", w / 2f, h * 0.97f, menuPaint)
+            statusPaint.textSize = h * 0.035f
+            canvas.drawText(statusText, w * 0.015f, h * 0.985f, statusPaint)
         }
 
         private fun drawHugeNumber(
