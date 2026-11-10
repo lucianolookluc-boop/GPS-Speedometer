@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- rodas -->
+    <path android:fillColor="#5A6479" android:pathData="M30,70 h10 v9 h-10 z" />
+    <path android:fillColor="#5A6479" android:pathData="M68,70 h10 v9 h-10 z" />
+    <!-- teto / para-brisa -->
+    <path android:fillColor="#7CC4FF" android:pathData="M36,42 L42,27 L66,27 L72,42 Z" />
+    <!-- carroceria -->
+    <path android:fillColor="#0091FF" android:pathData="M30,40 H78 Q82,40 82,44 V68 Q82,72 78,72 H30 Q26,72 26,68 V44 Q26,40 30,40 Z" />
+    <!-- faróis -->
+    <path android:fillColor="#FFE066" android:pathData="M30.5,62 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0" />
+    <path android:fillColor="#FFE066" android:pathData="M70.5,62 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0" />
+    <!-- grade -->
+    <path android:fillColor="#0B1220" android:pathData="M46,62 h16 v6 h-16 z" />
+    <!-- hastes dos óculos -->
+    <path android:strokeColor="#111111" android:strokeWidth="2.5" android:strokeLineCap="round" android:pathData="M37,41 L30,38" />
+    <path android:strokeColor="#111111" android:strokeWidth="2.5" android:strokeLineCap="round" android:pathData="M71,41 L78,38" />
+    <!-- ponte -->
+    <path android:strokeColor="#111111" android:strokeWidth="2.5" android:strokeLineCap="round" android:pathData="M52,41 L56,41" />
+    <!-- lentes -->
+    <path android:fillColor="#FFFFFF" android:strokeColor="#111111" android:strokeWidth="2.5" android:pathData="M37,42 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0" />
+    <path android:fillColor="#FFFFFF" android:strokeColor="#111111" android:strokeWidth="2.5" android:pathData="M55,42 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0" />
+    <!-- pupilas -->
+    <path android:fillColor="#111111" android:pathData="M43.5,43 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+    <path android:fillColor="#111111" android:pathData="M61.5,43 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+</vector>

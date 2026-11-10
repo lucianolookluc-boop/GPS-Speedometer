@@ -5,7 +5,9 @@
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <application
         android:allowBackup="false"
-        android:label="GPS Speedometer"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="GPS limite da via"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
             android:name=".MainActivity"

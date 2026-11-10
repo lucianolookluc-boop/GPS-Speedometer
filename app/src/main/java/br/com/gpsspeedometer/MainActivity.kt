@@ -1,4 +1,3 @@
-
 package br.com.gpsspeedometer
 
 import android.Manifest
@@ -43,6 +42,7 @@ import kotlin.math.floor
 import kotlin.math.sqrt
 
 private const val TILE_DEG = 0.02
+private const val STALE_MS = 120L * 24L * 60L * 60L * 1000L // 4 meses
 
 class MainActivity : Activity(), LocationListener {
     private lateinit var locationManager: LocationManager
@@ -52,26 +52,23 @@ class MainActivity : Activity(), LocationListener {
     private var lastLimit: Int? = null
     private var lastSpeakAt = 0L
     private var lastMatchAt = 0L
-    private var lastQueryLocation: Location? = null
-    private var lastQueryAt = 0L
-    private var hazards: List<RoadHazard> = emptyList()
     private val alerted = mutableMapOf<String, Long>()
     @Volatile private var lastLocation: Location? = null
     private val savedHazards = mutableListOf<RoadHazard>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val netExecutor = Executors.newCachedThreadPool()
-    private val hazardWorker = Executors.newSingleThreadExecutor()
-    private val hazardBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var mapHazards = false
 
     // Mapa local (limites de velocidade guardados no celular)
     private val tiles: MutableMap<String, List<LimitWay>> = ConcurrentHashMap()
     private val failedAt: MutableMap<String, Long> = ConcurrentHashMap()
-    private val bulkQueue = ConcurrentLinkedQueue<String>()
+    private val hazardTiles: MutableMap<String, List<RoadHazard>> = ConcurrentHashMap()
+    private val forceSet: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val bulkLimitQueue = ConcurrentLinkedQueue<String>()
+    private val bulkHazardQueue = ConcurrentLinkedQueue<String>()
     @Volatile private var bulkTotal = 0
     @Volatile private var bulkDone = 0
     @Volatile private var tileStatus = ""
-    @Volatile private var hazardStatus = ""
     @Volatile private var running = true
     private var tileThread: Thread? = null
 
@@ -88,7 +85,7 @@ class MainActivity : Activity(), LocationListener {
         speedView = SpeedDisplay(this)
         setContentView(speedView)
         loadSavedHazards()
-        mapHazards = getSharedPreferences("config", Context.MODE_PRIVATE).getBoolean("radares_mapa", false)
+        mapHazards = getSharedPreferences("config", Context.MODE_PRIVATE).getBoolean("radares_mapa2", true)
 
         var downX = 0f
         var downY = 0f
@@ -218,9 +215,10 @@ class MainActivity : Activity(), LocationListener {
             "Exportar radares (compartilhar)",
             "Importar radares (texto copiado)",
             "Apagar todos os radares",
-            "Radares do mapa: " + (if (mapHazards) "LIGADO (pode atrasar)" else "DESLIGADO"),
+            "Radares do mapa: " + (if (mapHazards) "LIGADO" else "DESLIGADO"),
             "Baixar mapa ao redor (11 km)",
-            "Baixar mapa ao redor (19 km)"
+            "Baixar mapa ao redor (19 km)",
+            "Atualizar mapa ao redor (11 km)"
         )
         AlertDialog.Builder(this)
             .setTitle("Radares salvos: ${savedHazards.size}")
@@ -233,16 +231,16 @@ class MainActivity : Activity(), LocationListener {
                     4 -> {
                         mapHazards = !mapHazards
                         getSharedPreferences("config", Context.MODE_PRIVATE).edit()
-                            .putBoolean("radares_mapa", mapHazards).apply()
-                        if (!mapHazards) hazards = emptyList()
+                            .putBoolean("radares_mapa2", mapHazards).apply()
                         Toast.makeText(
                             this,
                             if (mapHazards) "Radares do mapa ligados" else "Radares do mapa desligados",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
-                    5 -> startBulkDownload(2)
-                    6 -> startBulkDownload(4)
+                    5 -> startBulkDownload(2, false)
+                    6 -> startBulkDownload(4, false)
+                    7 -> startBulkDownload(2, true)
                 }
             }
             .setNegativeButton("Fechar", null)
@@ -303,15 +301,6 @@ class MainActivity : Activity(), LocationListener {
         speedView.setSpeed(kmh.toInt().toString())
 
         updateLimit(location)
-
-        val previous = lastQueryLocation
-        val movedEnough = previous == null || previous.distanceTo(location) >= 150f
-        val timeEnough = System.currentTimeMillis() - lastQueryAt >= 20_000L
-        if (movedEnough && timeEnough) {
-            lastQueryLocation = Location(location)
-            lastQueryAt = System.currentTimeMillis()
-            queryHazardsAsync(location)
-        }
         checkHazards(location)
     }
 
@@ -392,7 +381,27 @@ class MainActivity : Activity(), LocationListener {
         return best
     }
 
-    private fun nextNeededTile(): String? {
+    private fun hazardFile(key: String): File {
+        val dir = File(filesDir, "tiles")
+        dir.mkdirs()
+        return File(dir, "$key.h")
+    }
+
+    private fun isStale(f: File): Boolean = System.currentTimeMillis() - f.lastModified() > STALE_MS
+
+    private class Job(val key: String, val phase: Char, val bulk: Boolean)
+
+    // Ordem: 1) limites da area atual e vizinhas, 2) radares delas,
+    // 3) limites da regiao pedida, 4) radares da regiao pedida.
+    private fun nextJob(): Job? {
+        nextNeededTile('L')?.let { return Job(it, 'L', false) }
+        nextNeededTile('H')?.let { return Job(it, 'H', false) }
+        bulkLimitQueue.poll()?.let { return Job(it, 'L', true) }
+        bulkHazardQueue.poll()?.let { return Job(it, 'H', true) }
+        return null
+    }
+
+    private fun nextNeededTile(kind: Char): String? {
         val loc = lastLocation ?: return null
         val ix0 = floor(loc.longitude / TILE_DEG).toInt()
         val iy0 = floor(loc.latitude / TILE_DEG).toInt()
@@ -403,8 +412,9 @@ class MainActivity : Activity(), LocationListener {
         )
         for (o in order) {
             val key = tileKey(ix0 + o.first, iy0 + o.second)
-            if (tiles.containsKey(key)) continue
-            val f = failedAt[key]
+            val have = if (kind == 'L') tiles.containsKey(key) else hazardTiles.containsKey(key)
+            if (have) continue
+            val f = failedAt["$kind:$key"]
             if (f != null && now - f < 20_000L) continue
             return key
         }
@@ -415,11 +425,14 @@ class MainActivity : Activity(), LocationListener {
         val loc = lastLocation ?: return
         val ix0 = floor(loc.longitude / TILE_DEG).toInt()
         val iy0 = floor(loc.latitude / TILE_DEG).toInt()
-        for (k in tiles.keys.toList()) {
+        for (k in (tiles.keys + hazardTiles.keys).toList()) {
             val p = k.split("_")
             val ix = p.getOrNull(0)?.toIntOrNull() ?: continue
             val iy = p.getOrNull(1)?.toIntOrNull() ?: continue
-            if (abs(ix - ix0) > 2 || abs(iy - iy0) > 2) tiles.remove(k)
+            if (abs(ix - ix0) > 2 || abs(iy - iy0) > 2) {
+                tiles.remove(k)
+                hazardTiles.remove(k)
+            }
         }
     }
 
@@ -427,15 +440,15 @@ class MainActivity : Activity(), LocationListener {
         while (running) {
             try {
                 evictFar()
-                val needed = nextNeededTile()
-                val key = needed ?: bulkQueue.poll()
-                if (key == null) {
+                val job = nextJob()
+                if (job == null) {
                     Thread.sleep(1000)
                     continue
                 }
-                val isBulk = needed == null
-                loadOrDownload(key, !isBulk)
-                if (isBulk) {
+                val force = forceSet.remove("${job.phase}:${job.key}")
+                if (job.phase == 'L') loadLimits(job.key, !job.bulk, force)
+                else loadHazards(job.key, !job.bulk, force)
+                if (job.bulk) {
                     bulkDone++
                     if (bulkDone >= bulkTotal) {
                         bulkTotal = 0
@@ -444,7 +457,7 @@ class MainActivity : Activity(), LocationListener {
                     }
                 }
                 refreshStatus()
-                if (!isBulk) {
+                if (!job.bulk && job.phase == 'L') {
                     mainHandler.post { lastLocation?.let { updateLimit(it) } }
                 }
             } catch (e: InterruptedException) {
@@ -455,49 +468,176 @@ class MainActivity : Activity(), LocationListener {
         }
     }
 
-    private fun loadOrDownload(key: String, keepInMemory: Boolean) {
-        val file = tileFile(key)
+    private fun tileBbox(key: String): String {
+        val parts = key.split("_")
+        val ix = parts[0].toInt()
+        val iy = parts[1].toInt()
+        val south = String.format(Locale.US, "%.5f", iy * TILE_DEG)
+        val north = String.format(Locale.US, "%.5f", (iy + 1) * TILE_DEG)
+        val west = String.format(Locale.US, "%.5f", ix * TILE_DEG)
+        val east = String.format(Locale.US, "%.5f", (ix + 1) * TILE_DEG)
+        return "($south,$west,$north,$east)"
+    }
+
+    private fun writeAtomic(file: File, key: String, text: String) {
+        val tmp = File(file.parentFile, "$key.tmp")
+        tmp.writeText(text)
+        tmp.renameTo(file)
+    }
+
+    private fun loadLimits(key: String, keepInMemory: Boolean, force: Boolean) {
+        val t0 = System.currentTimeMillis()
         try {
-            if (file.exists()) {
-                if (keepInMemory) tiles[key] = parseTile(file.readText())
-                return
-            }
-            tileStatus = "baixando area..."
-            refreshStatus()
-            val parts = key.split("_")
-            val ix = parts[0].toInt()
-            val iy = parts[1].toInt()
-            val south = String.format(Locale.US, "%.5f", iy * TILE_DEG)
-            val north = String.format(Locale.US, "%.5f", (iy + 1) * TILE_DEG)
-            val west = String.format(Locale.US, "%.5f", ix * TILE_DEG)
-            val east = String.format(Locale.US, "%.5f", (ix + 1) * TILE_DEG)
-            val bbox = "($south,$west,$north,$east)"
-            val query = """
-                [out:json][timeout:60];
-                (
-                  way["highway"]["maxspeed"]$bbox;
-                  way["highway"]["maxspeed:forward"]$bbox;
-                  way["highway"]["maxspeed:backward"]$bbox;
-                );
-                out body geom;
-            """.trimIndent()
-            val t0 = System.currentTimeMillis()
-            val body = fetchAny(query, 75_000L, 70_000)
-            val elements = JSONObject(body).optJSONArray("elements")
-                ?: throw Exception("resposta sem dados")
-            val text = buildTileText(elements)
-            val tmp = File(file.parentFile, "$key.tmp")
-            tmp.writeText(text)
-            tmp.renameTo(file)
-            if (keepInMemory) tiles[key] = parseTile(text)
-            failedAt.remove(key)
-            tileStatus = "area baixada em ${(System.currentTimeMillis() - t0) / 1000}s"
+            syncLimits(key, tileBbox(key), keepInMemory, force)
+            failedAt.remove("L:$key")
+            tileStatus = "limites prontos (${(System.currentTimeMillis() - t0) / 1000}s)"
         } catch (e: InterruptedException) {
             throw e
         } catch (e: Exception) {
-            failedAt[key] = System.currentTimeMillis()
-            tileStatus = "erro ao baixar: ${e.message}"
+            failedAt["L:$key"] = System.currentTimeMillis()
+            tileStatus = "erro nos limites: ${e.message}"
         }
+    }
+
+    private fun loadHazards(key: String, keepInMemory: Boolean, force: Boolean) {
+        val t0 = System.currentTimeMillis()
+        try {
+            syncHazards(key, tileBbox(key), keepInMemory, force)
+            failedAt.remove("H:$key")
+            tileStatus = "radares prontos (${(System.currentTimeMillis() - t0) / 1000}s)"
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: Exception) {
+            failedAt["H:$key"] = System.currentTimeMillis()
+            tileStatus = "erro nos radares: ${e.message}"
+        }
+    }
+
+    private fun syncLimits(key: String, bbox: String, keep: Boolean, force: Boolean) {
+        val file = tileFile(key)
+        val exists = file.exists()
+        if (exists && keep && !tiles.containsKey(key)) tiles[key] = parseTile(file.readText())
+        if (exists && !force && !isStale(file)) return
+        tileStatus = "baixando limites..."
+        refreshStatus()
+        val query = """
+            [out:json][timeout:60];
+            (
+              way["highway"]["maxspeed"]$bbox;
+              way["highway"]["maxspeed:forward"]$bbox;
+              way["highway"]["maxspeed:backward"]$bbox;
+            );
+            out body geom;
+        """.trimIndent()
+        val body = fetchAny(query, 75_000L, 70_000)
+        val elements = JSONObject(body).optJSONArray("elements")
+            ?: throw Exception("resposta sem dados")
+        val text = buildTileText(elements)
+        writeAtomic(file, key, text)
+        if (keep || tiles.containsKey(key)) tiles[key] = parseTile(text)
+    }
+
+    private fun syncHazards(key: String, bbox: String, keep: Boolean, force: Boolean) {
+        val file = hazardFile(key)
+        val exists = file.exists()
+        if (exists && keep && !hazardTiles.containsKey(key)) hazardTiles[key] = parseHazardTile(file.readText())
+        if (exists && !force && !isStale(file)) return
+        tileStatus = "baixando radares..."
+        refreshStatus()
+        val camQuery = """
+            [out:json][timeout:60];
+            (
+              node["highway"="speed_camera"]$bbox;
+              node["enforcement"]$bbox;
+            );
+            out body;
+        """.trimIndent()
+        val cams = JSONObject(fetchAny(camQuery, 75_000L, 70_000)).optJSONArray("elements")
+            ?: throw Exception("resposta sem dados")
+        var bumps: JSONArray? = null
+        try {
+            val bumpQuery = """
+                [out:json][timeout:40];
+                node["traffic_calming"]$bbox;
+                out body;
+            """.trimIndent()
+            bumps = JSONObject(fetchAny(bumpQuery, 45_000L, 40_000)).optJSONArray("elements")
+        } catch (e: InterruptedException) {
+            throw e
+        } catch (e: Exception) {
+            // lombadas ficam de fora desta vez; radares continuam valendo
+        }
+        val text = buildHazardText(cams, bumps)
+        writeAtomic(file, key, text)
+        if (keep || hazardTiles.containsKey(key)) hazardTiles[key] = parseHazardTile(text)
+    }
+
+    private fun hazardKind(tags: JSONObject): String? {
+        val highway = tags.optString("highway")
+        val enforcement = tags.optString("enforcement")
+        return when {
+            highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" -> "camera"
+            enforcement == "traffic_signals" -> "signal_camera"
+            else -> null
+        }
+    }
+
+    private fun buildHazardText(cams: JSONArray, bumps: JSONArray?): String {
+        val sb = StringBuilder()
+        for (i in 0 until cams.length()) {
+            val item = cams.optJSONObject(i) ?: continue
+            if (item.optString("type") != "node") continue
+            val tags = item.optJSONObject("tags") ?: continue
+            val kind = hazardKind(tags) ?: continue
+            val la = item.optDouble("lat", Double.NaN)
+            val lo = item.optDouble("lon", Double.NaN)
+            if (la.isNaN() || lo.isNaN()) continue
+            sb.append(kind).append(',')
+                .append(String.format(Locale.US, "%.6f", la)).append(',')
+                .append(String.format(Locale.US, "%.6f", lo)).append('\n')
+        }
+        if (bumps != null) {
+            for (i in 0 until bumps.length()) {
+                val item = bumps.optJSONObject(i) ?: continue
+                if (item.optString("type") != "node") continue
+                val tags = item.optJSONObject("tags") ?: continue
+                val calming = tags.optString("traffic_calming")
+                if (calming.isBlank() || calming == "no") continue
+                val la = item.optDouble("lat", Double.NaN)
+                val lo = item.optDouble("lon", Double.NaN)
+                if (la.isNaN() || lo.isNaN()) continue
+                sb.append("bump,")
+                    .append(String.format(Locale.US, "%.6f", la)).append(',')
+                    .append(String.format(Locale.US, "%.6f", lo)).append('\n')
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun parseHazardTile(text: String): List<RoadHazard> {
+        val out = ArrayList<RoadHazard>()
+        for (line in text.split("\n")) {
+            val p = line.split(",")
+            if (p.size < 3) continue
+            val la = p[1].toDoubleOrNull() ?: continue
+            val lo = p[2].toDoubleOrNull() ?: continue
+            out.add(RoadHazard(p[0], la, lo))
+        }
+        return out
+    }
+
+    private fun mapHazardsNear(loc: Location): List<RoadHazard> {
+        if (!mapHazards) return emptyList()
+        val ix0 = floor(loc.longitude / TILE_DEG).toInt()
+        val iy0 = floor(loc.latitude / TILE_DEG).toInt()
+        val out = ArrayList<RoadHazard>()
+        for (dx in -1..1) {
+            for (dy in -1..1) {
+                val list = hazardTiles[tileKey(ix0 + dx, iy0 + dy)] ?: continue
+                out.addAll(list)
+            }
+        }
+        return out
     }
 
     private fun buildTileText(elements: JSONArray): String {
@@ -556,7 +696,7 @@ class MainActivity : Activity(), LocationListener {
         return out
     }
 
-    private fun startBulkDownload(radius: Int) {
+    private fun startBulkDownload(radius: Int, force: Boolean) {
         val loc = lastLocation
         if (loc == null) {
             Toast.makeText(this, "Aguarde o sinal de GPS", Toast.LENGTH_LONG).show()
@@ -564,19 +704,26 @@ class MainActivity : Activity(), LocationListener {
         }
         val ix0 = floor(loc.longitude / TILE_DEG).toInt()
         val iy0 = floor(loc.latitude / TILE_DEG).toInt()
-        var added = 0
+        var steps = 0
         for (dx in -radius..radius) {
             for (dy in -radius..radius) {
                 val key = tileKey(ix0 + dx, iy0 + dy)
-                if (tileFile(key).exists() || bulkQueue.contains(key)) continue
-                bulkQueue.add(key)
-                added++
+                if ((force || !tileFile(key).exists()) && !bulkLimitQueue.contains(key)) {
+                    if (force) forceSet.add("L:$key")
+                    bulkLimitQueue.add(key)
+                    steps++
+                }
+                if ((force || !hazardFile(key).exists()) && !bulkHazardQueue.contains(key)) {
+                    if (force) forceSet.add("H:$key")
+                    bulkHazardQueue.add(key)
+                    steps++
+                }
             }
         }
-        bulkTotal += added
+        bulkTotal += steps
         Toast.makeText(
             this,
-            if (added > 0) "Baixando $added areas. Mantenha o app aberto e com internet."
+            if (steps > 0) "Baixando primeiro os limites e depois os radares. Mantenha o app aberto e com internet."
             else "Essa regiao ja esta baixada.",
             Toast.LENGTH_LONG
         ).show()
@@ -585,10 +732,10 @@ class MainActivity : Activity(), LocationListener {
 
     private fun refreshStatus() {
         val vias = tiles.values.sumOf { it.size }
-        val sb = StringBuilder("Mapa local: ${tiles.size} areas, $vias vias")
+        val radares = hazardTiles.values.sumOf { it.size }
+        val sb = StringBuilder("Mapa local: ${tiles.size} areas, $vias vias, $radares radares/lombadas")
         if (bulkTotal > 0) sb.append(" | baixando regiao: $bulkDone/$bulkTotal")
         if (tileStatus.isNotEmpty()) sb.append(" | ").append(tileStatus)
-        if (hazardStatus.isNotEmpty()) sb.append(" | ").append(hazardStatus)
         val text = sb.toString()
         mainHandler.post { speedView.setStatus(text) }
     }
@@ -661,68 +808,6 @@ class MainActivity : Activity(), LocationListener {
         return JSONObject(body).optJSONArray("elements") ?: throw Exception("resposta sem dados")
     }
 
-    // ---------------- Radares do mapa (opcional) ----------------
-
-    private fun queryHazardsAsync(location: Location) {
-        if (!mapHazards) return
-        if (!hazardBusy.compareAndSet(false, true)) return
-        val lat = location.latitude
-        val lon = location.longitude
-        hazardWorker.execute {
-            try {
-                queryHazards(lat, lon)
-            } finally {
-                hazardBusy.set(false)
-            }
-        }
-    }
-
-    private fun queryHazards(lat: Double, lon: Double) {
-        val t1 = System.currentTimeMillis()
-        try {
-            val dLat = 650.0 / 111320.0
-            val dLon = dLat / Math.cos(Math.toRadians(lat)).coerceAtLeast(0.2)
-            val bbox = "(${lat - dLat},${lon - dLon},${lat + dLat},${lon + dLon})"
-            val hazardQuery = """
-                [out:json][timeout:20];
-                (
-                  node["highway"="speed_camera"]$bbox;
-                  node["enforcement"="maxspeed"]$bbox;
-                  node["enforcement"="average_speed"]$bbox;
-                  node["enforcement"="traffic_signals"]$bbox;
-                  node["traffic_calming"]$bbox;
-                );
-                out body;
-            """.trimIndent()
-            val elements = runQuery(hazardQuery)
-            val foundHazards = mutableListOf<RoadHazard>()
-            for (i in 0 until elements.length()) {
-                val item = elements.optJSONObject(i) ?: continue
-                if (item.optString("type") != "node") continue
-                val tags = item.optJSONObject("tags") ?: continue
-                val latValue = item.optDouble("lat", Double.NaN)
-                val lonValue = item.optDouble("lon", Double.NaN)
-                if (latValue.isNaN() || lonValue.isNaN()) continue
-                val highway = tags.optString("highway")
-                val enforcement = tags.optString("enforcement")
-                val calming = tags.optString("traffic_calming")
-                when {
-                    highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" ->
-                        foundHazards.add(RoadHazard("camera", latValue, lonValue))
-                    enforcement == "traffic_signals" ->
-                        foundHazards.add(RoadHazard("signal_camera", latValue, lonValue))
-                    calming.isNotBlank() && calming != "no" ->
-                        foundHazards.add(RoadHazard("bump", latValue, lonValue))
-                }
-            }
-            hazardStatus = "radares/lombadas no mapa: ${foundHazards.size} (${(System.currentTimeMillis() - t1) / 1000}s)"
-            mainHandler.post { hazards = foundHazards }
-        } catch (e: Exception) {
-            hazardStatus = "radares: erro apos ${(System.currentTimeMillis() - t1) / 1000}s: ${e.message}"
-        }
-        refreshStatus()
-    }
-
     private fun parseSpeedLimit(raw: String): Int? {
         val normalized = raw.trim().lowercase(Locale.ROOT)
         if (normalized.contains("mph")) return null
@@ -732,7 +817,7 @@ class MainActivity : Activity(), LocationListener {
     private fun checkHazards(location: Location) {
         if (!location.hasBearing()) return
         val now = System.currentTimeMillis()
-        for (hazard in hazards + savedHazards) {
+        for (hazard in mapHazardsNear(location) + savedHazards) {
             val point = Location("hazard").apply { latitude = hazard.lat; longitude = hazard.lon }
             val distance = location.distanceTo(point)
             if (distance !in 20f..450f) continue
@@ -770,7 +855,6 @@ class MainActivity : Activity(), LocationListener {
         tts?.stop()
         tts?.shutdown()
         netExecutor.shutdownNow()
-        hazardWorker.shutdownNow()
         super.onDestroy()
     }
 
