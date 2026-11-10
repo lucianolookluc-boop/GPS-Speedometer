@@ -15,6 +15,8 @@ import android.graphics.Typeface
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -58,6 +60,12 @@ class MainActivity : Activity(), LocationListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val netExecutor = Executors.newCachedThreadPool()
     @Volatile private var mapHazards = false
+    @Volatile private var lightAlerts = true
+    private var overspeedBeep = true
+    private var overspeedActive = false
+    private var lastBeepAt = 0L
+    private var lastLightAt = 0L
+    private var tone: ToneGenerator? = null
 
     // Mapa local (limites de velocidade guardados no celular)
     private val tiles: MutableMap<String, List<LimitWay>> = ConcurrentHashMap()
@@ -85,7 +93,11 @@ class MainActivity : Activity(), LocationListener {
         speedView = SpeedDisplay(this)
         setContentView(speedView)
         loadSavedHazards()
-        mapHazards = getSharedPreferences("config", Context.MODE_PRIVATE).getBoolean("radares_mapa2", true)
+        val cfg = getSharedPreferences("config", Context.MODE_PRIVATE)
+        mapHazards = cfg.getBoolean("radares_mapa2", true)
+        lightAlerts = cfg.getBoolean("aviso_semaforo", true)
+        overspeedBeep = cfg.getBoolean("bip_excesso", true)
+        tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 100) } catch (e: Exception) { null }
 
         var downX = 0f
         var downY = 0f
@@ -218,7 +230,9 @@ class MainActivity : Activity(), LocationListener {
             "Radares do mapa: " + (if (mapHazards) "LIGADO" else "DESLIGADO"),
             "Baixar mapa ao redor (11 km)",
             "Baixar mapa ao redor (19 km)",
-            "Atualizar mapa ao redor (11 km)"
+            "Atualizar mapa ao redor (11 km)",
+            "Aviso de semáforo: " + (if (lightAlerts) "LIGADO" else "DESLIGADO"),
+            "Bip ao passar do limite: " + (if (overspeedBeep) "LIGADO" else "DESLIGADO")
         )
         AlertDialog.Builder(this)
             .setTitle("Radares salvos: ${savedHazards.size}")
@@ -241,6 +255,26 @@ class MainActivity : Activity(), LocationListener {
                     5 -> startBulkDownload(2, false)
                     6 -> startBulkDownload(4, false)
                     7 -> startBulkDownload(2, true)
+                    8 -> {
+                        lightAlerts = !lightAlerts
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putBoolean("aviso_semaforo", lightAlerts).apply()
+                        Toast.makeText(
+                            this,
+                            if (lightAlerts) "Aviso de semáforo ligado" else "Aviso de semáforo desligado",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                    9 -> {
+                        overspeedBeep = !overspeedBeep
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putBoolean("bip_excesso", overspeedBeep).apply()
+                        Toast.makeText(
+                            this,
+                            if (overspeedBeep) "Bip de excesso ligado" else "Bip de excesso desligado",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 }
             }
             .setNegativeButton("Fechar", null)
@@ -301,7 +335,26 @@ class MainActivity : Activity(), LocationListener {
         speedView.setSpeed(kmh.toInt().toString())
 
         updateLimit(location)
+        checkOverspeed(kmh.toInt())
         checkHazards(location)
+    }
+
+    private fun beep() {
+        try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400) } catch (_: Exception) { }
+    }
+
+    private fun checkOverspeed(kmh: Int) {
+        val limit = lastLimit
+        if (!overspeedBeep || limit == null || kmh <= limit) {
+            overspeedActive = false
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (!overspeedActive || now - lastBeepAt >= 6000L) {
+            overspeedActive = true
+            lastBeepAt = now
+            beep()
+        }
     }
 
     private fun updateLimit(location: Location) {
@@ -384,7 +437,7 @@ class MainActivity : Activity(), LocationListener {
     private fun hazardFile(key: String): File {
         val dir = File(filesDir, "tiles")
         dir.mkdirs()
-        return File(dir, "$key.h")
+        return File(dir, "$key.h2")
     }
 
     private fun isStale(f: File): Boolean = System.currentTimeMillis() - f.lastModified() > STALE_MS
@@ -549,6 +602,7 @@ class MainActivity : Activity(), LocationListener {
             (
               node["highway"="speed_camera"]$bbox;
               node["enforcement"]$bbox;
+              node["highway"="traffic_signals"]$bbox;
             );
             out body;
         """.trimIndent()
@@ -578,6 +632,7 @@ class MainActivity : Activity(), LocationListener {
         return when {
             highway == "speed_camera" || enforcement == "maxspeed" || enforcement == "average_speed" -> "camera"
             enforcement == "traffic_signals" -> "signal_camera"
+            highway == "traffic_signals" -> "traffic_light"
             else -> null
         }
     }
@@ -733,7 +788,7 @@ class MainActivity : Activity(), LocationListener {
     private fun refreshStatus() {
         val vias = tiles.values.sumOf { it.size }
         val radares = hazardTiles.values.sumOf { it.size }
-        val sb = StringBuilder("Mapa local: ${tiles.size} areas, $vias vias, $radares radares/lombadas")
+        val sb = StringBuilder("Mapa local: ${tiles.size} areas, $vias vias, $radares alertas")
         if (bulkTotal > 0) sb.append(" | baixando regiao: $bulkDone/$bulkTotal")
         if (tileStatus.isNotEmpty()) sb.append(" | ").append(tileStatus)
         val text = sb.toString()
@@ -818,23 +873,36 @@ class MainActivity : Activity(), LocationListener {
         if (!location.hasBearing()) return
         val now = System.currentTimeMillis()
         for (hazard in mapHazardsNear(location) + savedHazards) {
+            val isLight = hazard.kind == "traffic_light"
+            if (isLight) {
+                if (!lightAlerts) continue
+                if (!location.hasSpeed() || location.speed < 3f) continue
+                if (now - lastLightAt < 8000L) continue
+            }
             val point = Location("hazard").apply { latitude = hazard.lat; longitude = hazard.lon }
             val distance = location.distanceTo(point)
-            if (distance !in 20f..450f) continue
+            val minDist = if (isLight) 30f else 20f
+            val maxDist = if (isLight) 160f else 450f
+            if (distance !in minDist..maxDist) continue
             val delta = abs(((location.bearingTo(point) - location.bearing + 540f) % 360f) - 180f)
-            if (delta > 75f) continue
+            if (delta > (if (isLight) 25f else 75f)) continue
             val saved = hazard.bearing
             if (saved != null) {
                 val diff = abs(((location.bearing - saved + 540f) % 360f) - 180f)
                 if (diff > 60f) continue
             }
             val key = "${hazard.kind}:${hazard.lat}:${hazard.lon}"
-            if (now - (alerted[key] ?: 0L) < 120_000L) continue
+            val cooldown = if (isLight) 40_000L else 120_000L
+            if (now - (alerted[key] ?: 0L) < cooldown) continue
             alerted[key] = now
             when (hazard.kind) {
                 "camera", "saved" -> speak("Radar na via")
                 "signal_camera" -> speak("Radar de semáforo na via")
                 "bump" -> speak("Lombada na via")
+                "traffic_light" -> {
+                    lastLightAt = now
+                    speak("Semáforo à frente")
+                }
             }
         }
     }
@@ -854,6 +922,7 @@ class MainActivity : Activity(), LocationListener {
         try { locationManager.removeUpdates(this) } catch (_: Exception) { }
         tts?.stop()
         tts?.shutdown()
+        try { tone?.release() } catch (_: Exception) { }
         netExecutor.shutdownNow()
         super.onDestroy()
     }
