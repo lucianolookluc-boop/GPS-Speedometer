@@ -15,12 +15,15 @@ import android.graphics.Typeface
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -66,6 +69,16 @@ class MainActivity : Activity(), LocationListener {
     private var lastBeepAt = 0L
     private var lastLightAt = 0L
     private var tone: ToneGenerator? = null
+    private lateinit var audio: AudioManager
+    private var channel = 0 // 0 Alarme, 1 Navegação, 2 Notificação, 3 Mídia
+    private var pendingSpeech = 0
+    private var ducked = false
+    private var savedMusicVol = -1
+    private var focusRequest: AudioFocusRequest? = null
+    private val restoreRunnable = Runnable {
+        pendingSpeech = 0
+        endDuck()
+    }
 
     // Mapa local (limites de velocidade guardados no celular)
     private val tiles: MutableMap<String, List<LimitWay>> = ConcurrentHashMap()
@@ -88,6 +101,7 @@ class MainActivity : Activity(), LocationListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemUi()
         speedView = SpeedDisplay(this)
@@ -97,7 +111,13 @@ class MainActivity : Activity(), LocationListener {
         mapHazards = cfg.getBoolean("radares_mapa2", true)
         lightAlerts = cfg.getBoolean("aviso_semaforo", true)
         overspeedBeep = cfg.getBoolean("bip_excesso", true)
-        tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 100) } catch (e: Exception) { null }
+        channel = cfg.getInt("canal_audio", 0)
+        val pendente = cfg.getInt("vol_midia_pendente", -1)
+        if (pendente >= 0) {
+            try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, pendente, 0) } catch (_: Exception) { }
+            cfg.edit().remove("vol_midia_pendente").apply()
+        }
+        recreateTone()
 
         var downX = 0f
         var downY = 0f
@@ -118,6 +138,14 @@ class MainActivity : Activity(), LocationListener {
                 val result = tts?.setLanguage(Locale("pt", "BR"))
                 ttsReady = result != TextToSpeech.LANG_MISSING_DATA &&
                     result != TextToSpeech.LANG_NOT_SUPPORTED
+                tts?.setAudioAttributes(channelAttrs(channel))
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) { speechFinished() }
+                    @Deprecated("Deprecated in Android")
+                    override fun onError(utteranceId: String?) { speechFinished() }
+                    override fun onError(utteranceId: String?, errorCode: Int) { speechFinished() }
+                })
             }
         }
 
@@ -232,7 +260,8 @@ class MainActivity : Activity(), LocationListener {
             "Baixar mapa ao redor (19 km)",
             "Atualizar mapa ao redor (11 km)",
             "Aviso de semáforo: " + (if (lightAlerts) "LIGADO" else "DESLIGADO"),
-            "Bip ao passar do limite: " + (if (overspeedBeep) "LIGADO" else "DESLIGADO")
+            "Bip ao passar do limite: " + (if (overspeedBeep) "LIGADO" else "DESLIGADO"),
+            "Canal de áudio: " + channelName(channel) + " (toque para trocar)"
         )
         AlertDialog.Builder(this)
             .setTitle("Radares salvos: ${savedHazards.size}")
@@ -264,6 +293,13 @@ class MainActivity : Activity(), LocationListener {
                             if (lightAlerts) "Aviso de semáforo ligado" else "Aviso de semáforo desligado",
                             Toast.LENGTH_SHORT
                         ).show()
+                    }
+                    10 -> {
+                        channel = (channel + 1) % 4
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putInt("canal_audio", channel).apply()
+                        applyChannel()
+                        speak("Teste de áudio, canal " + channelName(channel))
                     }
                     9 -> {
                         overspeedBeep = !overspeedBeep
@@ -339,7 +375,105 @@ class MainActivity : Activity(), LocationListener {
         checkHazards(location)
     }
 
+    private fun channelName(i: Int): String = when (i) {
+        0 -> "Alarme"
+        1 -> "Navegação"
+        2 -> "Notificação"
+        else -> "Mídia"
+    }
+
+    private fun channelStream(i: Int): Int = when (i) {
+        0 -> AudioManager.STREAM_ALARM
+        2 -> AudioManager.STREAM_NOTIFICATION
+        else -> AudioManager.STREAM_MUSIC
+    }
+
+    private fun channelAttrs(i: Int): AudioAttributes {
+        val usage = when (i) {
+            0 -> AudioAttributes.USAGE_ALARM
+            1 -> AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+            2 -> AudioAttributes.USAGE_NOTIFICATION
+            else -> AudioAttributes.USAGE_MEDIA
+        }
+        return AudioAttributes.Builder()
+            .setUsage(usage)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+    }
+
+    private fun recreateTone() {
+        try { tone?.release() } catch (_: Exception) { }
+        tone = try { ToneGenerator(channelStream(channel), 100) } catch (e: Exception) { null }
+    }
+
+    private fun applyChannel() {
+        tts?.setAudioAttributes(channelAttrs(channel))
+        recreateTone()
+    }
+
+    // Volume do canal do app sempre no máximo (só nos canais com volume próprio).
+    private fun maxOwnVolume() {
+        if (channel == 0 || channel == 2) {
+            try {
+                val st = channelStream(channel)
+                audio.setStreamVolume(st, audio.getStreamMaxVolume(st), 0)
+            } catch (_: Exception) { }
+        }
+    }
+
+    // Enquanto o app fala: pede foco de áudio (outros apps abaixam) e,
+    // nos canais com volume próprio, reduz a mídia pela metade.
+    private fun beginDuck() {
+        mainHandler.removeCallbacks(restoreRunnable)
+        if (ducked) return
+        ducked = true
+        try {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(channelAttrs(channel))
+                .build()
+            focusRequest = req
+            audio.requestAudioFocus(req)
+        } catch (_: Exception) { }
+        maxOwnVolume()
+        if (channel == 0 || channel == 2) {
+            try {
+                val cur = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+                if (cur > 1) {
+                    savedMusicVol = cur
+                    getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                        .putInt("vol_midia_pendente", cur).apply()
+                    audio.setStreamVolume(AudioManager.STREAM_MUSIC, cur / 2, 0)
+                }
+            } catch (_: Exception) {
+                savedMusicVol = -1
+            }
+        }
+    }
+
+    private fun endDuck() {
+        if (!ducked) return
+        ducked = false
+        try {
+            if (savedMusicVol >= 0) audio.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVol, 0)
+        } catch (_: Exception) { }
+        savedMusicVol = -1
+        getSharedPreferences("config", Context.MODE_PRIVATE).edit().remove("vol_midia_pendente").apply()
+        try { focusRequest?.let { audio.abandonAudioFocusRequest(it) } } catch (_: Exception) { }
+        focusRequest = null
+    }
+
+    private fun speechFinished() {
+        mainHandler.post {
+            if (pendingSpeech > 0) pendingSpeech--
+            if (pendingSpeech == 0) {
+                mainHandler.removeCallbacks(restoreRunnable)
+                mainHandler.postDelayed(restoreRunnable, 400L)
+            }
+        }
+    }
+
     private fun beep() {
+        maxOwnVolume()
         try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400) } catch (_: Exception) { }
     }
 
@@ -608,20 +742,7 @@ class MainActivity : Activity(), LocationListener {
         """.trimIndent()
         val cams = JSONObject(fetchAny(camQuery, 75_000L, 70_000)).optJSONArray("elements")
             ?: throw Exception("resposta sem dados")
-        var bumps: JSONArray? = null
-        try {
-            val bumpQuery = """
-                [out:json][timeout:40];
-                node["traffic_calming"]$bbox;
-                out body;
-            """.trimIndent()
-            bumps = JSONObject(fetchAny(bumpQuery, 45_000L, 40_000)).optJSONArray("elements")
-        } catch (e: InterruptedException) {
-            throw e
-        } catch (e: Exception) {
-            // lombadas ficam de fora desta vez; radares continuam valendo
-        }
-        val text = buildHazardText(cams, bumps)
+        val text = buildHazardText(cams)
         writeAtomic(file, key, text)
         if (keep || hazardTiles.containsKey(key)) hazardTiles[key] = parseHazardTile(text)
     }
@@ -637,7 +758,7 @@ class MainActivity : Activity(), LocationListener {
         }
     }
 
-    private fun buildHazardText(cams: JSONArray, bumps: JSONArray?): String {
+    private fun buildHazardText(cams: JSONArray): String {
         val sb = StringBuilder()
         for (i in 0 until cams.length()) {
             val item = cams.optJSONObject(i) ?: continue
@@ -651,21 +772,6 @@ class MainActivity : Activity(), LocationListener {
                 .append(String.format(Locale.US, "%.6f", la)).append(',')
                 .append(String.format(Locale.US, "%.6f", lo)).append('\n')
         }
-        if (bumps != null) {
-            for (i in 0 until bumps.length()) {
-                val item = bumps.optJSONObject(i) ?: continue
-                if (item.optString("type") != "node") continue
-                val tags = item.optJSONObject("tags") ?: continue
-                val calming = tags.optString("traffic_calming")
-                if (calming.isBlank() || calming == "no") continue
-                val la = item.optDouble("lat", Double.NaN)
-                val lo = item.optDouble("lon", Double.NaN)
-                if (la.isNaN() || lo.isNaN()) continue
-                sb.append("bump,")
-                    .append(String.format(Locale.US, "%.6f", la)).append(',')
-                    .append(String.format(Locale.US, "%.6f", lo)).append('\n')
-            }
-        }
         return sb.toString()
     }
 
@@ -674,6 +780,7 @@ class MainActivity : Activity(), LocationListener {
         for (line in text.split("\n")) {
             val p = line.split(",")
             if (p.size < 3) continue
+            if (p[0] == "bump") continue // lombadas não são mais usadas
             val la = p[1].toDoubleOrNull() ?: continue
             val lo = p[2].toDoubleOrNull() ?: continue
             out.add(RoadHazard(p[0], la, lo))
@@ -898,7 +1005,6 @@ class MainActivity : Activity(), LocationListener {
             when (hazard.kind) {
                 "camera", "saved" -> speak("Radar na via")
                 "signal_camera" -> speak("Radar de semáforo na via")
-                "bump" -> speak("Lombada na via")
                 "traffic_light" -> {
                     lastLightAt = now
                     speak("Semáforo à frente")
@@ -908,7 +1014,12 @@ class MainActivity : Activity(), LocationListener {
     }
 
     private fun speak(message: String) {
-        if (ttsReady) tts?.speak(message, TextToSpeech.QUEUE_ADD, null, "gps_${System.currentTimeMillis()}")
+        if (!ttsReady) return
+        pendingSpeech++
+        beginDuck()
+        mainHandler.removeCallbacks(restoreRunnable)
+        mainHandler.postDelayed(restoreRunnable, 15_000L) // segurança
+        tts?.speak(message, TextToSpeech.QUEUE_ADD, null, "gps_${System.currentTimeMillis()}")
     }
 
     override fun onProviderEnabled(provider: String) {}
@@ -923,6 +1034,8 @@ class MainActivity : Activity(), LocationListener {
         tts?.stop()
         tts?.shutdown()
         try { tone?.release() } catch (_: Exception) { }
+        mainHandler.removeCallbacks(restoreRunnable)
+        endDuck()
         netExecutor.shutdownNow()
         super.onDestroy()
     }
