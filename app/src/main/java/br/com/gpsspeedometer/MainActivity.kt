@@ -87,6 +87,8 @@ class MainActivity : Activity(), LocationListener {
     private var overlayView: SpeedDisplay? = null
     private var curLimit = ""
     private var curSpeed = ""
+    private var curOver = false
+    private var limitVoice = true
     private val restoreRunnable = Runnable {
         pendingSpeech = 0
         endDuck()
@@ -126,6 +128,7 @@ class MainActivity : Activity(), LocationListener {
         channel = cfg.getInt("canal_audio", 0)
         duckMode = cfg.getInt("modo_duck", 0)
         floatingEnabled = cfg.getBoolean("flutuante", false)
+        limitVoice = cfg.getBoolean("voz_limite", true)
         val pendente = cfg.getInt("vol_midia_pendente", -1)
         if (pendente >= 0) {
             try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, pendente, 0) } catch (_: Exception) { }
@@ -277,7 +280,8 @@ class MainActivity : Activity(), LocationListener {
             "Bip ao passar do limite: " + (if (overspeedBeep) "LIGADO" else "DESLIGADO"),
             "Canal de áudio: " + channelName(channel) + " (toque para trocar)",
             "Música durante o aviso: " + duckName(duckMode) + " (toque para trocar)",
-            "Tela flutuante: " + (if (floatingEnabled) "LIGADA" else "DESLIGADA")
+            "Tela flutuante: " + (if (floatingEnabled) "LIGADA" else "DESLIGADA"),
+            "Voz do limite da via: " + (if (limitVoice) "LIGADA" else "DESLIGADA")
         )
         AlertDialog.Builder(this)
             .setTitle("Radares salvos: ${savedHazards.size}")
@@ -317,6 +321,16 @@ class MainActivity : Activity(), LocationListener {
                         speak("Teste de áudio. Música: " + duckName(duckMode))
                     }
                     12 -> toggleFloating()
+                    13 -> {
+                        limitVoice = !limitVoice
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putBoolean("voz_limite", limitVoice).apply()
+                        Toast.makeText(
+                            this,
+                            if (limitVoice) "Voz do limite ligada" else "Voz do limite desligada",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                     10 -> {
                         channel = (channel + 1) % 4
                         getSharedPreferences("config", Context.MODE_PRIVATE).edit()
@@ -520,6 +534,13 @@ class MainActivity : Activity(), LocationListener {
         overlayView?.setLimit(v)
     }
 
+    private fun showOver(v: Boolean) {
+        if (v == curOver) return
+        curOver = v
+        speedView.setOver(v)
+        overlayView?.setOver(v)
+    }
+
     private fun showStatus(v: String) {
         speedView.setStatus(v)
     }
@@ -531,7 +552,9 @@ class MainActivity : Activity(), LocationListener {
 
     private fun checkOverspeed(kmh: Int) {
         val limit = lastLimit
-        if (!overspeedBeep || limit == null || kmh <= limit) {
+        val over = limit != null && kmh > limit
+        showOver(over)
+        if (!overspeedBeep || !over) {
             overspeedActive = false
             return
         }
@@ -551,7 +574,7 @@ class MainActivity : Activity(), LocationListener {
             showLimit(found.toString())
             if (lastLimit != found) {
                 lastLimit = found
-                if (now - lastSpeakAt > 8000L) {
+                if (limitVoice && now - lastSpeakAt > 8000L) {
                     lastSpeakAt = now
                     speak("Limite de velocidade, $found quilômetros por hora")
                 }
@@ -1040,8 +1063,8 @@ class MainActivity : Activity(), LocationListener {
             }
             val point = Location("hazard").apply { latitude = hazard.lat; longitude = hazard.lon }
             val distance = location.distanceTo(point)
-            val minDist = if (isLight) 30f else 20f
-            val maxDist = if (isLight) 160f else 450f
+            val minDist = 20f
+            val maxDist = if (isLight) 100f else 450f
             if (distance !in minDist..maxDist) continue
             val delta = abs(((location.bearingTo(point) - location.bearing + 540f) % 360f) - 180f)
             if (delta > (if (isLight) 25f else 75f)) continue
@@ -1051,7 +1074,7 @@ class MainActivity : Activity(), LocationListener {
                 if (diff > 60f) continue
             }
             val key = "${hazard.kind}:${hazard.lat}:${hazard.lon}"
-            val cooldown = if (isLight) 40_000L else 120_000L
+            val cooldown = if (isLight) 90_000L else 120_000L
             if (now - (alerted[key] ?: 0L) < cooldown) continue
             alerted[key] = now
             when (hazard.kind) {
@@ -1157,6 +1180,7 @@ class MainActivity : Activity(), LocationListener {
         val v = SpeedDisplay(this, true)
         v.setLimit(curLimit)
         v.setSpeed(curSpeed)
+        v.setOver(curOver)
         attachOverlayTouch(v, params, wm)
         try {
             wm.addView(v, params)
@@ -1297,6 +1321,7 @@ class MainActivity : Activity(), LocationListener {
         private var statusText = ""
         private var limitText = ""
         private var speedText = ""
+        private var over = false
 
         private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(150, 150, 150)
@@ -1307,6 +1332,7 @@ class MainActivity : Activity(), LocationListener {
         init { setBackgroundColor(if (compact) Color.argb(225, 0, 0, 0) else Color.BLACK) }
         fun setLimit(value: String) { limitText = value; postInvalidateOnAnimation() }
         fun setSpeed(value: String) { speedText = value; postInvalidateOnAnimation() }
+        fun setOver(value: Boolean) { over = value; postInvalidateOnAnimation() }
         fun setStatus(value: String) { statusText = value; postInvalidateOnAnimation() }
 
         fun inMenuZone(x: Float, y: Float): Boolean =
@@ -1316,6 +1342,7 @@ class MainActivity : Activity(), LocationListener {
             super.onDraw(canvas)
             val w = width.toFloat()
             val h = height.toFloat()
+            rightPaint.color = if (over) Color.rgb(255, 140, 0) else Color.rgb(0, 145, 255)
             if (h > w) {
                 // Vertical: limite em cima, velocidade embaixo
                 drawHugeNumber(canvas, limitText, 0f, w, 0f, h / 2f, leftPaint)
