@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.PixelFormat
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.location.Location
@@ -19,12 +20,17 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
@@ -75,6 +81,12 @@ class MainActivity : Activity(), LocationListener {
     private var ducked = false
     private var savedMusicVol = -1
     private var focusRequest: AudioFocusRequest? = null
+    private var duckMode = 0 // 0 abaixa 50%, 1 foco do sistema, 2 não abaixa
+    private var floatingEnabled = false
+    private var pendingFloating = false
+    private var overlayView: SpeedDisplay? = null
+    private var curLimit = ""
+    private var curSpeed = ""
     private val restoreRunnable = Runnable {
         pendingSpeech = 0
         endDuck()
@@ -112,6 +124,8 @@ class MainActivity : Activity(), LocationListener {
         lightAlerts = cfg.getBoolean("aviso_semaforo", true)
         overspeedBeep = cfg.getBoolean("bip_excesso", true)
         channel = cfg.getInt("canal_audio", 0)
+        duckMode = cfg.getInt("modo_duck", 0)
+        floatingEnabled = cfg.getBoolean("flutuante", false)
         val pendente = cfg.getInt("vol_midia_pendente", -1)
         if (pendente >= 0) {
             try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, pendente, 0) } catch (_: Exception) { }
@@ -261,7 +275,9 @@ class MainActivity : Activity(), LocationListener {
             "Atualizar mapa ao redor (11 km)",
             "Aviso de semáforo: " + (if (lightAlerts) "LIGADO" else "DESLIGADO"),
             "Bip ao passar do limite: " + (if (overspeedBeep) "LIGADO" else "DESLIGADO"),
-            "Canal de áudio: " + channelName(channel) + " (toque para trocar)"
+            "Canal de áudio: " + channelName(channel) + " (toque para trocar)",
+            "Música durante o aviso: " + duckName(duckMode) + " (toque para trocar)",
+            "Tela flutuante: " + (if (floatingEnabled) "LIGADA" else "DESLIGADA")
         )
         AlertDialog.Builder(this)
             .setTitle("Radares salvos: ${savedHazards.size}")
@@ -294,6 +310,13 @@ class MainActivity : Activity(), LocationListener {
                             Toast.LENGTH_SHORT
                         ).show()
                     }
+                    11 -> {
+                        duckMode = (duckMode + 1) % 3
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putInt("modo_duck", duckMode).apply()
+                        speak("Teste de áudio. Música: " + duckName(duckMode))
+                    }
+                    12 -> toggleFloating()
                     10 -> {
                         channel = (channel + 1) % 4
                         getSharedPreferences("config", Context.MODE_PRIVATE).edit()
@@ -368,7 +391,7 @@ class MainActivity : Activity(), LocationListener {
     override fun onLocationChanged(location: Location) {
         lastLocation = location
         val kmh = if (location.hasSpeed()) (location.speed * 3.6f).coerceAtLeast(0f) else 0f
-        speedView.setSpeed(kmh.toInt().toString())
+        showSpeed(kmh.toInt().toString())
 
         updateLimit(location)
         checkOverspeed(kmh.toInt())
@@ -423,19 +446,32 @@ class MainActivity : Activity(), LocationListener {
 
     // Enquanto o app fala: pede foco de áudio (outros apps abaixam) e,
     // nos canais com volume próprio, reduz a mídia pela metade.
+    private fun duckName(i: Int): String = when (i) {
+        0 -> "abaixa 50%"
+        1 -> "foco do sistema"
+        else -> "não abaixa"
+    }
+
+    // Enquanto o app fala, abaixa a música conforme o modo escolhido:
+    // 0 = reduz o volume da mídia pela metade (sem pedir foco, para não mutar o rádio do carro)
+    // 1 = pede foco de áudio ao sistema   2 = não mexe na música
     private fun beginDuck() {
         mainHandler.removeCallbacks(restoreRunnable)
         if (ducked) return
         ducked = true
-        try {
-            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                .setAudioAttributes(channelAttrs(channel))
-                .build()
-            focusRequest = req
-            audio.requestAudioFocus(req)
-        } catch (_: Exception) { }
         maxOwnVolume()
-        if (channel == 0 || channel == 2) {
+        val ownVolume = channel == 0 || channel == 2
+        val useFocus = duckMode == 1 || (duckMode == 0 && !ownVolume)
+        if (useFocus) {
+            try {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(channelAttrs(channel))
+                    .build()
+                focusRequest = req
+                audio.requestAudioFocus(req)
+            } catch (_: Exception) { }
+        }
+        if (duckMode == 0 && ownVolume) {
             try {
                 val cur = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
                 if (cur > 1) {
@@ -472,6 +508,22 @@ class MainActivity : Activity(), LocationListener {
         }
     }
 
+    private fun showSpeed(v: String) {
+        curSpeed = v
+        speedView.setSpeed(v)
+        overlayView?.setSpeed(v)
+    }
+
+    private fun showLimit(v: String) {
+        curLimit = v
+        speedView.setLimit(v)
+        overlayView?.setLimit(v)
+    }
+
+    private fun showStatus(v: String) {
+        speedView.setStatus(v)
+    }
+
     private fun beep() {
         maxOwnVolume()
         try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400) } catch (_: Exception) { }
@@ -496,7 +548,7 @@ class MainActivity : Activity(), LocationListener {
         val found = lookupLimit(location)
         if (found != null) {
             lastMatchAt = now
-            speedView.setLimit(found.toString())
+            showLimit(found.toString())
             if (lastLimit != found) {
                 lastLimit = found
                 if (now - lastSpeakAt > 8000L) {
@@ -506,7 +558,7 @@ class MainActivity : Activity(), LocationListener {
             }
         } else if (lastLimit != null && now - lastMatchAt > 15_000L) {
             lastLimit = null
-            speedView.setLimit("")
+            showLimit("")
         }
     }
 
@@ -899,7 +951,7 @@ class MainActivity : Activity(), LocationListener {
         if (bulkTotal > 0) sb.append(" | baixando regiao: $bulkDone/$bulkTotal")
         if (tileStatus.isNotEmpty()) sb.append(" | ").append(tileStatus)
         val text = sb.toString()
-        mainHandler.post { speedView.setStatus(text) }
+        mainHandler.post { showStatus(text) }
     }
 
     // ---------------- Rede (Overpass) ----------------
@@ -1027,7 +1079,175 @@ class MainActivity : Activity(), LocationListener {
     @Deprecated("Deprecated in Android")
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
 
+    // ---------------- Tela flutuante ----------------
+
+    private fun toggleFloating() {
+        if (floatingEnabled) {
+            floatingEnabled = false
+            getSharedPreferences("config", Context.MODE_PRIVATE).edit().putBoolean("flutuante", false).apply()
+            removeOverlay()
+            stopService(Intent(this, KeepAliveService::class.java))
+            Toast.makeText(this, "Tela flutuante desligada", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!Settings.canDrawOverlays(this)) {
+            pendingFloating = true
+            Toast.makeText(
+                this,
+                "Ative \"Exibir sobre outros apps\" para este app e volte.",
+                Toast.LENGTH_LONG
+            ).show()
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            } catch (_: Exception) { }
+            return
+        }
+        enableFloating()
+    }
+
+    private fun enableFloating() {
+        floatingEnabled = true
+        getSharedPreferences("config", Context.MODE_PRIVATE).edit().putBoolean("flutuante", true).apply()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 101)
+        }
+        startKeepAlive()
+        Toast.makeText(this, "Tela flutuante ligada. Aperte Home para ver a janela.", Toast.LENGTH_LONG).show()
+    }
+
+    private fun startKeepAlive() {
+        try {
+            startForegroundService(Intent(this, KeepAliveService::class.java))
+        } catch (_: Exception) { }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        removeOverlay()
+        if (pendingFloating && Settings.canDrawOverlays(this)) {
+            pendingFloating = false
+            enableFloating()
+        } else if (floatingEnabled) {
+            startKeepAlive()
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        addOverlay()
+    }
+
+    private fun addOverlay() {
+        if (overlayView != null) return
+        if (!floatingEnabled || !Settings.canDrawOverlays(this)) return
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val cfg = getSharedPreferences("config", Context.MODE_PRIVATE)
+        val d = resources.displayMetrics.density
+        val params = WindowManager.LayoutParams(
+            cfg.getInt("ov_w", (260 * d).toInt()),
+            cfg.getInt("ov_h", (150 * d).toInt()),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        params.x = cfg.getInt("ov_x", (20 * d).toInt())
+        params.y = cfg.getInt("ov_y", (80 * d).toInt())
+        val v = SpeedDisplay(this, true)
+        v.setLimit(curLimit)
+        v.setSpeed(curSpeed)
+        attachOverlayTouch(v, params, wm)
+        try {
+            wm.addView(v, params)
+            overlayView = v
+        } catch (_: Exception) { }
+    }
+
+    private fun removeOverlay() {
+        val v = overlayView ?: return
+        try {
+            (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
+        } catch (_: Exception) { }
+        overlayView = null
+    }
+
+    private fun attachOverlayTouch(v: SpeedDisplay, params: WindowManager.LayoutParams, wm: WindowManager) {
+        val d = resources.displayMetrics.density
+        val minW = (110 * d).toInt()
+        val minH = (80 * d).toInt()
+        val maxW = resources.displayMetrics.widthPixels
+        val maxH = resources.displayMetrics.heightPixels
+        val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                params.width = (params.width * detector.scaleFactor).toInt().coerceIn(minW, maxW)
+                params.height = (params.height * detector.scaleFactor).toInt().coerceIn(minH, maxH)
+                try { wm.updateViewLayout(v, params) } catch (_: Exception) { }
+                return true
+            }
+        })
+        var mode = 0 // 1 mover, 2 redimensionar pelo canto
+        var startRawX = 0f
+        var startRawY = 0f
+        var startX = 0
+        var startY = 0
+        var startW = 0
+        var startH = 0
+        var moved = false
+        v.setOnTouchListener { view, ev ->
+            scale.onTouchEvent(ev)
+            if (scale.isInProgress) {
+                moved = true
+                return@setOnTouchListener true
+            }
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    startRawX = ev.rawX
+                    startRawY = ev.rawY
+                    startX = params.x
+                    startY = params.y
+                    startW = params.width
+                    startH = params.height
+                    moved = false
+                    mode = if (ev.x > view.width - 48 * d && ev.y > view.height - 48 * d) 2 else 1
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = ev.rawX - startRawX
+                    val dy = ev.rawY - startRawY
+                    if (abs(dx) > 8 * d || abs(dy) > 8 * d) moved = true
+                    if (moved && ev.pointerCount == 1) {
+                        if (mode == 2) {
+                            params.width = (startW + dx).toInt().coerceIn(minW, maxW)
+                            params.height = (startH + dy).toInt().coerceIn(minH, maxH)
+                        } else {
+                            params.x = (startX + dx).toInt()
+                            params.y = (startY + dy).toInt()
+                        }
+                        try { wm.updateViewLayout(v, params) } catch (_: Exception) { }
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) {
+                        try {
+                            startActivity(
+                                Intent(this, MainActivity::class.java)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                            )
+                        } catch (_: Exception) { }
+                    } else {
+                        getSharedPreferences("config", Context.MODE_PRIVATE).edit()
+                            .putInt("ov_x", params.x).putInt("ov_y", params.y)
+                            .putInt("ov_w", params.width).putInt("ov_h", params.height).apply()
+                    }
+                }
+            }
+            true
+        }
+    }
+
     override fun onDestroy() {
+        removeOverlay()
+        if (floatingEnabled) stopService(Intent(this, KeepAliveService::class.java))
         running = false
         tileThread?.interrupt()
         try { locationManager.removeUpdates(this) } catch (_: Exception) { }
@@ -1052,7 +1272,7 @@ class MainActivity : Activity(), LocationListener {
         val maxLon: Double
     )
 
-    private class SpeedDisplay(context: Context) : View(context) {
+    private class SpeedDisplay(context: Context, private val compact: Boolean = false) : View(context) {
         private val leftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(57, 255, 20)
             typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
@@ -1078,7 +1298,13 @@ class MainActivity : Activity(), LocationListener {
         private var limitText = ""
         private var speedText = ""
 
-        init { setBackgroundColor(Color.BLACK) }
+        private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(150, 150, 150)
+            strokeWidth = 4f
+            strokeCap = Paint.Cap.ROUND
+        }
+
+        init { setBackgroundColor(if (compact) Color.argb(225, 0, 0, 0) else Color.BLACK) }
         fun setLimit(value: String) { limitText = value; postInvalidateOnAnimation() }
         fun setSpeed(value: String) { speedText = value; postInvalidateOnAnimation() }
         fun setStatus(value: String) { statusText = value; postInvalidateOnAnimation() }
@@ -1098,6 +1324,13 @@ class MainActivity : Activity(), LocationListener {
                 // Horizontal: limite à esquerda, velocidade à direita
                 drawHugeNumber(canvas, limitText, 0f, w / 2f, 0f, h, leftPaint)
                 drawHugeNumber(canvas, speedText, w / 2f, w, 0f, h, rightPaint)
+            }
+            if (compact) {
+                // alça de redimensionar no canto inferior direito
+                val hs = minOf(w, h) * 0.16f
+                canvas.drawLine(w - hs, h - 3f, w - 3f, h - hs, handlePaint)
+                canvas.drawLine(w - hs * 0.55f, h - 3f, w - 3f, h - hs * 0.55f, handlePaint)
+                return
             }
             menuPaint.textSize = h * 0.045f
             canvas.drawText("•••", w / 2f, h * 0.97f, menuPaint)
