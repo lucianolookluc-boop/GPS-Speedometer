@@ -10,7 +10,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.location.Location
@@ -89,6 +91,7 @@ class MainActivity : Activity(), LocationListener {
     private var curSpeed = ""
     private var curOver = false
     private var limitVoice = true
+    private var muteAll = false
     private val restoreRunnable = Runnable {
         pendingSpeech = 0
         endDuck()
@@ -143,10 +146,16 @@ class MainActivity : Activity(), LocationListener {
             false
         }
         speedView.setOnClickListener {
-            if (speedView.inMenuZone(downX, downY)) showMenu()
+            when {
+                speedView.inCloseZone(downX, downY) -> closeApp()
+                speedView.inMuteZone(downX, downY) -> toggleMute()
+                speedView.inMenuZone(downX, downY) -> showMenu()
+            }
         }
         speedView.setOnLongClickListener {
-            saveRadarHere()
+            if (!speedView.inCloseZone(downX, downY) && !speedView.inMuteZone(downX, downY)) {
+                saveRadarHere()
+            }
             true
         }
 
@@ -534,6 +543,28 @@ class MainActivity : Activity(), LocationListener {
         overlayView?.setLimit(v)
     }
 
+    private fun toggleMute() {
+        muteAll = !muteAll
+        speedView.setMuted(muteAll)
+        if (muteAll) {
+            try { tts?.stop() } catch (_: Exception) { }
+            mainHandler.removeCallbacks(restoreRunnable)
+            pendingSpeech = 0
+            endDuck()
+        }
+        Toast.makeText(
+            this,
+            if (muteAll) "Avisos sonoros silenciados" else "Avisos sonoros ligados",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun closeApp() {
+        removeOverlay()
+        try { stopService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) { }
+        finishAndRemoveTask()
+    }
+
     private fun showOver(v: Boolean) {
         if (v == curOver) return
         curOver = v
@@ -546,6 +577,7 @@ class MainActivity : Activity(), LocationListener {
     }
 
     private fun beep() {
+        if (muteAll) return
         maxOwnVolume()
         try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400) } catch (_: Exception) { }
     }
@@ -1089,7 +1121,7 @@ class MainActivity : Activity(), LocationListener {
     }
 
     private fun speak(message: String) {
-        if (!ttsReady) return
+        if (!ttsReady || muteAll) return
         pendingSpeech++
         beginDuck()
         mainHandler.removeCallbacks(restoreRunnable)
@@ -1218,6 +1250,7 @@ class MainActivity : Activity(), LocationListener {
         var startW = 0
         var startH = 0
         var moved = false
+        var inClose = false
         v.setOnTouchListener { view, ev ->
             scale.onTouchEvent(ev)
             if (scale.isInProgress) {
@@ -1233,6 +1266,7 @@ class MainActivity : Activity(), LocationListener {
                     startW = params.width
                     startH = params.height
                     moved = false
+                    inClose = v.inCloseZone(ev.x, ev.y)
                     mode = if (ev.x > view.width - 48 * d && ev.y > view.height - 48 * d) 2 else 1
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -1251,7 +1285,9 @@ class MainActivity : Activity(), LocationListener {
                     }
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) {
+                    if (!moved && inClose) {
+                        closeApp()
+                    } else if (!moved) {
                         try {
                             startActivity(
                                 Intent(this, MainActivity::class.java)
@@ -1322,6 +1358,20 @@ class MainActivity : Activity(), LocationListener {
         private var limitText = ""
         private var speedText = ""
         private var over = false
+        private var muted = false
+        private val density = context.resources.displayMetrics.density
+        private val closeRect = RectF()
+        private val muteRect = RectF()
+        private val btnBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val btnStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val btnFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
 
         private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(150, 150, 150)
@@ -1332,6 +1382,54 @@ class MainActivity : Activity(), LocationListener {
         init { setBackgroundColor(if (compact) Color.argb(225, 0, 0, 0) else Color.BLACK) }
         fun setLimit(value: String) { limitText = value; postInvalidateOnAnimation() }
         fun setSpeed(value: String) { speedText = value; postInvalidateOnAnimation() }
+        fun setMuted(value: Boolean) { muted = value; postInvalidateOnAnimation() }
+
+        private fun inRect(r: RectF, x: Float, y: Float): Boolean {
+            if (r.isEmpty) return false
+            val pad = 8 * density
+            return x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad
+        }
+
+        fun inCloseZone(x: Float, y: Float): Boolean = inRect(closeRect, x, y)
+        fun inMuteZone(x: Float, y: Float): Boolean = !compact && inRect(muteRect, x, y)
+
+        private fun drawCloseButton(canvas: Canvas, r: RectF) {
+            val cx = r.centerX()
+            val cy = r.centerY()
+            val rad = r.width() / 2f
+            btnBgPaint.color = Color.argb(170, 60, 60, 60)
+            canvas.drawCircle(cx, cy, rad, btnBgPaint)
+            btnStrokePaint.strokeWidth = 3f * density
+            val u = rad * 0.38f
+            canvas.drawLine(cx - u, cy - u, cx + u, cy + u, btnStrokePaint)
+            canvas.drawLine(cx - u, cy + u, cx + u, cy - u, btnStrokePaint)
+        }
+
+        private fun drawMuteButton(canvas: Canvas, r: RectF) {
+            val cx = r.centerX()
+            val cy = r.centerY()
+            val rad = r.width() / 2f
+            btnBgPaint.color = if (muted) Color.argb(210, 200, 50, 40) else Color.argb(170, 60, 60, 60)
+            canvas.drawCircle(cx, cy, rad, btnBgPaint)
+            val u = rad * 0.34f
+            val path = Path()
+            path.moveTo(cx - u * 1.1f, cy - u * 0.55f)
+            path.lineTo(cx - u * 0.45f, cy - u * 0.55f)
+            path.lineTo(cx + u * 0.35f, cy - u * 1.15f)
+            path.lineTo(cx + u * 0.35f, cy + u * 1.15f)
+            path.lineTo(cx - u * 0.45f, cy + u * 0.55f)
+            path.lineTo(cx - u * 1.1f, cy + u * 0.55f)
+            path.close()
+            canvas.drawPath(path, btnFillPaint)
+            if (!muted) {
+                btnStrokePaint.strokeWidth = 2.2f * density
+                canvas.drawArc(RectF(cx - u * 0.2f, cy - u * 0.75f, cx + u * 1.3f, cy + u * 0.75f), -50f, 100f, false, btnStrokePaint)
+            } else {
+                btnStrokePaint.strokeWidth = 3f * density
+                canvas.drawLine(cx - u * 1.3f, cy + u * 1.3f, cx + u * 1.3f, cy - u * 1.3f, btnStrokePaint)
+            }
+        }
+
         fun setOver(value: Boolean) { over = value; postInvalidateOnAnimation() }
         fun setStatus(value: String) { statusText = value; postInvalidateOnAnimation() }
 
@@ -1343,22 +1441,33 @@ class MainActivity : Activity(), LocationListener {
             val w = width.toFloat()
             val h = height.toFloat()
             rightPaint.color = if (over) Color.rgb(255, 140, 0) else Color.rgb(0, 145, 255)
+            val top = if (compact) 0f else 56f * density
             if (h > w) {
                 // Vertical: limite em cima, velocidade embaixo
-                drawHugeNumber(canvas, limitText, 0f, w, 0f, h / 2f, leftPaint)
+                drawHugeNumber(canvas, limitText, 0f, w, top, h / 2f, leftPaint)
                 drawHugeNumber(canvas, speedText, 0f, w, h / 2f, h, rightPaint)
             } else {
                 // Horizontal: limite à esquerda, velocidade à direita
-                drawHugeNumber(canvas, limitText, 0f, w / 2f, 0f, h, leftPaint)
-                drawHugeNumber(canvas, speedText, w / 2f, w, 0f, h, rightPaint)
+                drawHugeNumber(canvas, limitText, 0f, w / 2f, top, h, leftPaint)
+                drawHugeNumber(canvas, speedText, w / 2f, w, top, h, rightPaint)
             }
             if (compact) {
-                // alça de redimensionar no canto inferior direito
+                // botão fechar (X) pequeno + alça de redimensionar
+                val bs = 30f * density
+                val mg = 4f * density
+                closeRect.set(w - mg - bs, mg, w - mg, mg + bs)
+                drawCloseButton(canvas, closeRect)
                 val hs = minOf(w, h) * 0.16f
                 canvas.drawLine(w - hs, h - 3f, w - 3f, h - hs, handlePaint)
                 canvas.drawLine(w - hs * 0.55f, h - 3f, w - 3f, h - hs * 0.55f, handlePaint)
                 return
             }
+            val bs = 46f * density
+            val mg = 10f * density
+            closeRect.set(w - mg - bs, mg, w - mg, mg + bs)
+            muteRect.set(closeRect.left - mg - bs, mg, closeRect.left - mg, mg + bs)
+            drawCloseButton(canvas, closeRect)
+            drawMuteButton(canvas, muteRect)
             menuPaint.textSize = h * 0.045f
             canvas.drawText("•••", w / 2f, h * 0.97f, menuPaint)
             statusPaint.textSize = minOf(h, w) * 0.03f
